@@ -61,6 +61,10 @@ For a standalone .exe you can share with anyone (no Python needed):
 
 Not a developer? Open `windows/SETUP_PROMPT.md`, paste it into Claude or ChatGPT, and the AI walks you through setup step by step.
 
+### Or build your own
+
+Don't want to run mine? [BUILD_YOUR_OWN.md](BUILD_YOUR_OWN.md) is a ready-made prompt you paste into an AI coding agent (Claude Code, Codex, Cursor). It walks you through building your own version from scratch, milestone by milestone, in an hour or two -- including the hard-won lessons so you don't repeat my mistakes.
+
 ### Mac
 
 1. Download the `mac/` folder
