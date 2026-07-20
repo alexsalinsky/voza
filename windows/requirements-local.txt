@@ -1,0 +1,4 @@
+# Extra dependency for FREE local transcription (no API needed for transcription)
+# Install this ON TOP of requirements.txt if you want to avoid Whisper API costs.
+# Then set TRANSCRIPTION_MODE = "local" in config.py
+faster-whisper>=1.0.0

@@ -1,0 +1,10 @@
+sounddevice
+numpy
+scipy
+pyperclip
+pynput
+python-dotenv
+faster-whisper
+pystray
+Pillow
+openai

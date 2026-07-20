@@ -1,0 +1,18 @@
+keyboard>=0.13.5
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.10.0
+pyperclip>=1.8.2
+pyautogui>=0.9.54
+python-dotenv>=1.0.0
+pycaw>=20230407
+comtypes>=1.2.0
+faster-whisper>=1.0.0
+pystray>=0.19.0
+Pillow>=10.0.0
+
+# Optional — only needed if you add an OpenAI API key for cloud features
+openai>=1.30.0
+
+# Optional — Claude fallback for stitching/cleanup when OpenAI quota is exhausted
+anthropic>=0.30.0
