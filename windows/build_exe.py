@@ -2,12 +2,7 @@
 Voza -- Build a share-ready package.
 
 Creates a 'voza-share' folder containing:
-  - voza.exe          (standalone, no Python needed)
-  - config.py         (so users can tweak settings)
-  - .env.example      (instructions for optional API key)
-  - icon_idle.ico     (tray icons)
-  - icon_recording.ico
-  - icon_processing.ico
+  - voza.exe          (standalone, no Python needed -- icons, config, and usage tracking are built in)
   - README.txt        (simple instructions for non-techy users)
 
 Usage:
@@ -130,16 +125,20 @@ nothing leaves your computer.
 WANT BETTER ACCURACY? (optional)
 ================================
 
-You can connect to OpenAI's cloud service for higher-quality transcription.
-It costs about $0.006 per minute of speech (~$2/month for typical use).
+You can connect to a cloud service for faster, higher-quality transcription.
+Recommended: Groq (about $0.35/month for typical use).
 
 To set it up:
-1. Go to: https://platform.openai.com/api-keys
-2. Create an account and get an API key
-3. In this folder, rename ".env.example" to ".env"
-4. Open .env with Notepad and replace the placeholder with your real key
+1. Go to: https://console.groq.com/keys
+2. Create a free account and get an API key
+3. In this folder, create a file named ".env" using Notepad
+4. Put this single line in it (with your real key):
+   GROQ_API_KEY=gsk_your-key-here
 5. Restart voza.exe
 6. Click the tray icon and toggle "Transcription" to "API (cloud)"
+
+(OpenAI also works: get a key at platform.openai.com/api-keys and use
+OPENAI_API_KEY=sk-... instead.)
 
 
 ================================
@@ -152,9 +151,10 @@ From there you can:
   - Turn AI text cleanup on/off
   - Change the language (English, Spanish, or auto-detect)
   - Mute your speakers while recording
+  - Add custom vocabulary (names, jargon)
   - Change hotkeys
 
-For advanced settings, edit config.py in Notepad.
+Everything is configurable from that window -- no files to edit.
 
 
 ================================
@@ -169,6 +169,7 @@ TIPS
   (~150 MB). This only happens once.
 
 
+Source code + updates: https://github.com/alexsalinsky/voza
 Learn more: https://www.linkedin.com/in/alexsalinsky/
 """
 
