@@ -2072,6 +2072,15 @@ def main():
     print(f"  {config.APP_NAME} -- {config.APP_TAGLINE}")
     print(f"  by {config.APP_AUTHOR}")
     print()
+    print(f"  Voza is a voice dictation tool. Press a hotkey, speak, press it")
+    print(f"  again, and your words appear as text wherever your cursor is --")
+    print(f"  in any app: email, chat, docs, browser.")
+    print()
+    print(f"  HOW TO USE:")
+    print(f"    1. Click into any text field")
+    print(f"    2. Press {config.HOTKEY} and start talking (you'll hear a beep)")
+    print(f"    3. Press {config.HOTKEY} again to stop -- your text appears")
+    print()
 
     _ensure_single_instance()
 
@@ -2148,10 +2157,21 @@ def main():
     # Start system tray icon
     _start_tray()
 
-    # Hide the console window after startup (tray takes over)
-    # Small delay to let the user see the startup messages
+    # Hide the console window after startup (tray takes over).
+    # First launch ever: keep it visible long enough to read the intro.
     if not config.DEBUG:
-        time.sleep(1.5)
+        first_run_marker = os.path.join(SCRIPT_DIR, ".voza_seen")
+        if not os.path.exists(first_run_marker):
+            print("  This window will minimize in 12 seconds. Voza keeps running in the")
+            print("  system tray -- look for the microphone icon near the clock.")
+            try:
+                with open(first_run_marker, "w") as f:
+                    f.write("shown")
+            except OSError:
+                pass
+            time.sleep(12)
+        else:
+            time.sleep(1.5)
         _hide_console()
         log("Console hidden — use tray icon to show/quit")
 
