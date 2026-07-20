@@ -29,6 +29,13 @@ from openai import OpenAI
 import config
 import usage
 
+# Windows consoles default to cp1252, which crashes on ✓/— in startup prints
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # ─── Windows-native hotkey manager (replaces 'keyboard' library) ────────────
 # Uses RegisterHotKey API — no keyboard hooks, no input corruption.
@@ -183,6 +190,7 @@ chunk_frame_index = 0      # How many frames have been chunked so far
 
 # Optional: local whisper model (loaded lazily)
 local_whisper_model = None
+local_parakeet_model = None
 
 # Session stats
 session_stats = {"dictations": 0, "total_seconds": 0, "start_time": None}
@@ -229,6 +237,38 @@ def apply_custom_vocab():
 
 
 apply_custom_vocab()
+
+# Corrections — "heard → meant" pairs applied to every final transcript
+CORRECTIONS_FILE = os.path.join(SCRIPT_DIR, "corrections.json")
+
+
+def load_corrections():
+    try:
+        import json
+        with open(CORRECTIONS_FILE, "r", encoding="utf-8") as f:
+            pairs = json.load(f)
+        return {str(k).strip(): str(v).strip() for k, v in pairs.items()
+                if str(k).strip() and str(v).strip()}
+    except Exception:
+        return {}
+
+
+def save_corrections(pairs):
+    try:
+        import json
+        with open(CORRECTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(pairs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Could not save corrections: {e}")
+
+
+def apply_corrections(text):
+    """Replace known mis-hearings with the intended words (whole-word, case-insensitive)."""
+    import re
+    for heard, meant in load_corrections().items():
+        text = re.sub(r"(?i)\b" + re.escape(heard) + r"\b", meant, text)
+    return text
+
 
 # Hotkey debounce — prevents double-firing
 _last_hotkey_time = 0.0
@@ -552,13 +592,15 @@ def _build_status_window():
         win.attributes("-topmost", True)
         win.configure(bg="#1e1e1e")
 
-        # Try to set window icon
-        ico_path = os.path.join(SCRIPT_DIR, "icon_idle.ico")
-        if os.path.exists(ico_path):
-            try:
-                win.iconbitmap(ico_path)
-            except Exception:
-                pass
+        # Try to set window icon (prefer the Voza logo, fall back to tray icon)
+        for _ico_name in ("voza.ico", "icon_idle.ico"):
+            _ico_path = os.path.join(SCRIPT_DIR, _ico_name)
+            if os.path.exists(_ico_path):
+                try:
+                    win.iconbitmap(_ico_path)
+                    break
+                except Exception:
+                    continue
 
         # Center on screen
         w, h = 360, 600
@@ -674,6 +716,20 @@ def _build_status_window():
                        toggle_transcription_ui,
                        lambda: "API (cloud)" if config.TRANSCRIPTION_MODE == "api" else "Local (free)")
 
+        # Local engine (Parakeet vs Whisper) — only offered if Parakeet is installed
+        if _parakeet_available():
+            def toggle_local_engine_ui():
+                config.LOCAL_ENGINE = (
+                    "whisper" if config.LOCAL_ENGINE == "parakeet" else "parakeet"
+                )
+                threading.Thread(target=_ensure_local_model, daemon=True).start()
+
+            make_toggle_row(toggle_frame, "Local Engine",
+                           lambda: config.LOCAL_ENGINE == "parakeet",
+                           toggle_local_engine_ui,
+                           lambda: "Parakeet (best)" if config.LOCAL_ENGINE == "parakeet"
+                           else f"Whisper {config.LOCAL_WHISPER_MODEL}")
+
         # AI Cleanup
         def toggle_cleanup_ui():
             if not config.API_KEY and not config.ENABLE_CLEANUP:
@@ -729,6 +785,33 @@ def _build_status_window():
                        lambda: bool(load_custom_vocab()),
                        edit_custom_vocab,
                        lambda: f"{len(load_custom_vocab())} words")
+
+        # Corrections — heard → meant pairs, fixed on every dictation
+        def edit_corrections():
+            current = ", ".join(f"{k} = {v}" for k, v in load_corrections().items())
+            new_val = simpledialog.askstring(
+                "Corrections",
+                "Fix words Voza keeps getting wrong (works with every engine).\n"
+                "Format: heard = meant, comma-separated.\n"
+                "Example: Maya = Maia, trello board = Trello board",
+                initialvalue=current,
+                parent=win,
+            )
+            if new_val is None:
+                return
+            pairs = {}
+            for part in new_val.split(","):
+                if "=" in part:
+                    heard, meant = part.split("=", 1)
+                    if heard.strip() and meant.strip():
+                        pairs[heard.strip()] = meant.strip()
+            save_corrections(pairs)
+            print(f"  Corrections updated: {len(pairs)} pair(s)")
+
+        make_toggle_row(toggle_frame, "Corrections",
+                       lambda: bool(load_corrections()),
+                       edit_corrections,
+                       lambda: f"{len(load_corrections())} pairs")
 
         # Simple hotkeys toggle
         def toggle_simple_mode():
@@ -1275,9 +1358,44 @@ def _transcribe_chunk(wav_buf, chunk_num):
 
 
 # ─── Transcription ───────────────────────────────────────────────────────────
+def _parakeet_available():
+    """True if the Parakeet engine can actually be used on this machine."""
+    if not os.path.isdir(config.PARAKEET_MODEL_DIR):
+        return False
+    try:
+        import sherpa_onnx  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _ensure_local_model():
-    """Load the local Whisper model if not already loaded."""
-    global local_whisper_model
+    """Load the configured local model (Parakeet or Whisper) if not already loaded."""
+    global local_whisper_model, local_parakeet_model
+
+    if config.LOCAL_ENGINE == "parakeet":
+        if local_parakeet_model is not None:
+            return
+        if _parakeet_available():
+            print("  Loading local Parakeet model (first time may take a moment)...")
+            import sherpa_onnx
+            d = config.PARAKEET_MODEL_DIR
+            local_parakeet_model = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=os.path.join(d, "encoder.int8.onnx"),
+                decoder=os.path.join(d, "decoder.int8.onnx"),
+                joiner=os.path.join(d, "joiner.int8.onnx"),
+                tokens=os.path.join(d, "tokens.txt"),
+                num_threads=4,
+                model_type="nemo_transducer",
+            )
+            print("  ✓ Local model 'parakeet-tdt-0.6b-v3' loaded")
+            dlog("[LOCAL] Parakeet model loaded")
+            return
+        print("  ⚠ Parakeet engine not available (missing sherpa-onnx or model folder)")
+        print("    Falling back to local Whisper. See config.py PARAKEET_MODEL_DIR.")
+        dlog("[LOCAL] Parakeet NOT available — fell back to whisper")
+        config.LOCAL_ENGINE = "whisper"
+
     if local_whisper_model is None:
         print("  Loading local Whisper model (first time may take a moment)...")
         from faster_whisper import WhisperModel
@@ -1348,7 +1466,7 @@ def _transcribe_api(wav_buf):
 
 
 def _transcribe_local(wav_buf):
-    """Use local faster-whisper model."""
+    """Use the local engine (Parakeet or faster-whisper)."""
     _ensure_local_model()
 
     # Estimate audio duration for tracking
@@ -1360,6 +1478,27 @@ def _transcribe_local(wav_buf):
         wav_buf.seek(0)
     except Exception:
         audio_seconds = 0
+
+    if config.LOCAL_ENGINE == "parakeet" and local_parakeet_model is not None:
+        # Parakeet auto-detects language; the forced-language setting only
+        # applies to the Whisper engines.
+        import wave as _wave
+        import numpy as _np
+        wav_buf.seek(0)
+        with _wave.open(wav_buf) as wf:
+            sr = wf.getframerate()
+            samples = _np.frombuffer(
+                wf.readframes(wf.getnframes()), dtype=_np.int16
+            ).astype(_np.float32) / 32768.0
+        stream = local_parakeet_model.create_stream()
+        stream.accept_waveform(sr, samples)
+        local_parakeet_model.decode_stream(stream)
+        text = stream.result.text.strip()
+
+        dlog(f"[LOCAL] Engine: parakeet | {audio_seconds:.1f}s audio")
+        usage.log_local_call(audio_seconds)
+        log(f"Raw transcription (parakeet): {text} (audio: {audio_seconds:.1f}s, free)")
+        return text
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.write(wav_buf.read())
@@ -1374,6 +1513,7 @@ def _transcribe_local(wav_buf):
     segments, _ = local_whisper_model.transcribe(tmp.name, **transcribe_kwargs)
     text = " ".join(seg.text for seg in segments).strip()
 
+    dlog(f"[LOCAL] Engine: whisper-{config.LOCAL_WHISPER_MODEL} | {audio_seconds:.1f}s audio")
     # Track usage (free, but still track volume)
     usage.log_local_call(audio_seconds)
     log(f"Raw transcription (local): {text} (audio: {audio_seconds:.1f}s, free)")
@@ -1832,6 +1972,8 @@ def process_dictation():
             print(f"  ⚠ Detected hallucination after cleanup, skipping")
             return
 
+        final_text = apply_corrections(final_text)
+
         # Track session stats
         session_stats["dictations"] += 1
         session_stats["total_seconds"] += frames_duration_secs(audio_frames)
@@ -2068,6 +2210,14 @@ def _ensure_single_instance():
 def main():
     global client
 
+    # Give the process its own Windows taskbar identity so panel windows show
+    # the Voza icon instead of python.exe's
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AlexSalinsky.Voza")
+    except Exception:
+        pass
+
     print()
     print(f"  {config.APP_NAME} -- {config.APP_TAGLINE}")
     print(f"  by {config.APP_AUTHOR}")
@@ -2122,7 +2272,12 @@ def main():
         _ensure_local_model()
 
     # Status display
-    mode = "API (cloud)" if config.TRANSCRIPTION_MODE == "api" else "LOCAL (free)"
+    if config.TRANSCRIPTION_MODE == "api":
+        mode = "API (cloud)"
+    else:
+        engine = "Parakeet" if (config.LOCAL_ENGINE == "parakeet" and _parakeet_available()) \
+            else f"Whisper {config.LOCAL_WHISPER_MODEL}"
+        mode = f"LOCAL (free, {engine})"
     cleanup_state = "ON" if config.ENABLE_CLEANUP else "OFF"
     lang_labels = {"auto": "AUTO-DETECT", "en": "ENGLISH", "es": "ESPAÑOL"}
     lang_label = lang_labels.get(config.LANGUAGE, config.LANGUAGE.upper())

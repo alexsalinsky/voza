@@ -25,6 +25,8 @@ I use it every day for emails, Slack messages, notes, and long-form writing. It 
 - **Auto-fallback** -- if the API is unreachable, falls back to local transcription automatically
 - **Optional AI cleanup** -- fixes punctuation, grammar, and filler words (toggle on/off)
 - **Custom vocabulary** -- add names or jargon so Whisper hears them correctly
+- **Corrections list** -- teach Voza "when you hear X, write Y" (works with every engine, including local ones that don't accept vocabulary hints)
+- **Upgradeable local engine** -- optional NVIDIA Parakeet v3 model: near whisper-large accuracy fully offline, 25 languages with auto-detect (see below)
 - **Smart spacing** -- inserts a space when a dictation continues a previous one
 - **Background chunking** -- transcribes while you speak, so even 5-minute dictations finish processing in about a second
 - **Multi-language** -- English, Spanish, auto-detect (add more in config)
@@ -82,6 +84,21 @@ Voza works out of the box in fully local mode (free). To enable cloud transcript
 2. Copy `.env.example` to `.env` and paste your key
 3. Restart Voza
 
+### Optional: Better local transcription (Parakeet)
+
+The default local engine is faster-whisper `base` -- small and quick, but it makes mistakes. If you want serious accuracy while staying 100% offline, Voza also supports **NVIDIA Parakeet v3** (int8, via sherpa-onnx): accuracy in the whisper-large class, 25 languages with automatic language detection, running at several times realtime on CPU.
+
+1. `pip install sherpa-onnx`
+2. Download the model (~640 MB) from [huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8) and place the folder at `windows/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/`
+3. Set `LOCAL_ENGINE = "parakeet"` in `config.py` (or flip the Local Engine toggle in the settings window)
+
+Notes: uses ~1 GB of RAM while loaded (lazy-loaded on first local transcription). If the model folder or sherpa-onnx is missing, Voza falls back to faster-whisper automatically. One known limit: Parakeet detects language once per dictation, so switching languages mid-sentence confuses it -- cloud Whisper handles mixed-language speech better.
+
+## Tips
+
+- **Mouse button as the dictation key:** if your mouse software supports key remapping (Logitech Options+, Razer Synapse, etc.), map a side button to Ctrl+Shift+Space at the driver level. You get one-click dictation with zero code and none of the risks of low-level mouse hooks (see BUILD_YOUR_OWN.md for why those are a bad idea).
+- **Fix recurring mishears:** if an engine keeps writing "Maya" when you say "Maia", add `Maya = Maia` to the Corrections list in the settings window. Corrections apply to the final text on every engine, cloud or local.
+
 ## How it works
 
 ```
@@ -110,12 +127,12 @@ For advanced configuration, edit `config.py`.
 ## Tech stack
 
 - **Python 3.10+**
-- **Whisper via Groq or OpenAI**, or **faster-whisper** (local) for speech-to-text
+- **Whisper via Groq or OpenAI**, or **faster-whisper** / **NVIDIA Parakeet v3** (sherpa-onnx) for local speech-to-text
 - **llama-3.1-8b-instant** (Groq) or **GPT-4o-mini** (OpenAI) for optional text cleanup
 - **sounddevice** for audio capture
 - **pystray + Pillow** for system tray
 - **tkinter** for settings UI
-- **keyboard** (Windows) / **pynput** (Mac) for global hotkeys
+- **RegisterHotKey Windows API** (no keyboard hooks) / **pynput** (Mac) for global hotkeys
 - **PyInstaller** for standalone Windows .exe builds
 
 ## Troubleshooting

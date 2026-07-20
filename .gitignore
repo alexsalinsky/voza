@@ -30,5 +30,12 @@ Thumbs.db
 voza-share/
 voza-launcher.vbs
 *.ico
+*.zip
+
+# Per-user local files
+usage.json
+corrections.json
+.voza_seen
+models/
 
 LINKEDIN_POST.md
