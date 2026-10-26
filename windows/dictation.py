@@ -536,7 +536,9 @@ def _save_api_key(key):
         config.API_PROVIDER = "groq"
         config.API_BASE_URL = "https://api.groq.com/openai/v1"
         config.WHISPER_MODEL = "whisper-large-v3-turbo"
-        config.CLEANUP_MODEL = "llama-3.1-8b-instant"
+        config.CLEANUP_MODEL = "openai/gpt-oss-20b"
+        config.CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
+        config.CLEANUP_TOKEN_HEADROOM = 512
     else:
         config.OPENAI_API_KEY = key
         if config.API_PROVIDER != "groq":
@@ -1771,6 +1773,14 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
 
 
 # ─── Stitching ───────────────────────────────────────────────────────────────
+def _cleanup_extra_body():
+    return getattr(config, "CLEANUP_EXTRA_BODY", None) or None
+
+
+def _cleanup_headroom():
+    return getattr(config, "CLEANUP_TOKEN_HEADROOM", 0)
+
+
 def stitch_chunks(chunk_texts):
     """Merge overlapping chunk transcriptions into clean, continuous text.
     Tries GPT first for smart de-duplication, falls back to local stitching."""
@@ -1790,9 +1800,12 @@ def stitch_chunks(chunk_texts):
                 {"role": "user", "content": numbered},
             ],
             temperature=0.2,
-            max_tokens=min(4000, max(300, len(numbered) // 2)),
+            max_tokens=min(4000, max(300, len(numbered) // 2)) + _cleanup_headroom(),
+            extra_body=_cleanup_extra_body(),
         )
-        result = response.choices[0].message.content.strip()
+        result = (response.choices[0].message.content or "").strip()
+        if not result:
+            raise ValueError("empty stitch response")
 
         # Guard: stitched output can't exceed the combined chunks. If it grew,
         # the model answered the dictation content instead of stitching it.
@@ -1838,6 +1851,58 @@ def _stitch_claude(chunk_texts):
         return _stitch_local(chunk_texts)
 
 
+def _stitch_word(w):
+    """Normalize one word for overlap matching: case and punctuation don't count."""
+    return "".join(ch for ch in w.lower() if ch.isalnum())
+
+
+def _stitch_words_match(a, b):
+    if a == b:
+        return True
+    # Tolerate small spelling drift between chunks ("Voza" vs "Vosa")
+    if len(a) >= 4 and len(b) >= 4:
+        import difflib
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
+    return False
+
+
+def _find_chunk_overlap(result_words, next_words):
+    """Find where the next chunk's audio overlap repeats the end of the result.
+
+    Each chunk starts with ~OVERLAP_SECS of audio already transcribed at the
+    end of the previous one. Whisper rarely transcribes that stretch the same
+    way twice: punctuation and capitals change ("desktop. So" vs "desktop, so"),
+    and the words at either cut edge can be clipped or dropped. So match on
+    normalized words, let up to 3 leading words of the next chunk and up to 4
+    trailing words of the result fall outside the match, and take the longest
+    run. Returns (length, drop_tail, skip_head) or None.
+    """
+    a = [_stitch_word(w) for w in result_words]
+    b = [_stitch_word(w) for w in next_words]
+    best = None  # (length, -(skip+drop), drop, skip)
+    for skip in range(0, min(4, len(b))):
+        for drop in range(0, min(5, len(a))):
+            max_len = min(30, len(a) - drop, len(b) - skip)
+            for length in range(max_len, 0, -1):
+                # Short matches only count when they sit right at the seam
+                if (length < 3 and skip + drop > 1) or (length == 1 and skip + drop > 0):
+                    break
+                tail = a[len(a) - drop - length:len(a) - drop]
+                head = b[skip:skip + length]
+                misses = sum(1 for x, y in zip(tail, head) if not _stitch_words_match(x, y))
+                if misses == 0 or (length >= 6 and misses == 1):
+                    cand = (length, -(skip + drop), drop, skip)
+                    if best is None or cand > best:
+                        best = cand
+                    break
+    if best is None:
+        # A word clipped at the cut ("compl") that the next chunk heard whole
+        if a and b and len(a[-1]) >= 3 and b[0].startswith(a[-1]) and b[0] != a[-1]:
+            return 0, 1, 0
+        return None
+    return best[0], best[2], best[3]
+
+
 def _stitch_local(chunk_texts):
     """Simple local stitching: find overlapping words between consecutive chunks
     and remove duplicates. No API needed."""
@@ -1846,21 +1911,19 @@ def _stitch_local(chunk_texts):
     result = chunk_texts[0]
     for i in range(1, len(chunk_texts)):
         next_chunk = chunk_texts[i]
-        # Try to find overlap: check if the end of the current result
-        # matches the beginning of the next chunk
         result_words = result.split()
         next_words = next_chunk.split()
-        best_overlap = 0
-        # Check overlap windows from 3 to 30 words
-        for overlap_len in range(min(30, len(result_words), len(next_words)), 2, -1):
-            tail = " ".join(result_words[-overlap_len:]).lower().strip(".,!? ")
-            head = " ".join(next_words[:overlap_len]).lower().strip(".,!? ")
-            if tail == head:
-                best_overlap = overlap_len
-                break
-        if best_overlap > 0:
-            dlog(f"[STITCH] Found {best_overlap}-word overlap between chunk {i} and {i+1}")
-            result = result + " " + " ".join(next_words[best_overlap:])
+        found = _find_chunk_overlap(result_words, next_words)
+        if found:
+            length, drop, skip = found
+            # The next chunk heard the seam in full, so its version wins:
+            # drop the result's clipped tail words and the repeated head.
+            kept = result_words[:len(result_words) - drop]
+            if length:
+                # Seam punctuation comes from the chunk that heard what followed
+                kept[-1] = next_words[skip + length - 1]
+            dlog(f"[STITCH] Found {length}-word overlap between chunk {i} and {i+1} (skip {skip}, drop {drop})")
+            result = " ".join(kept + next_words[skip + length:])
         else:
             dlog(f"[STITCH] No overlap found, concatenating chunk {i+1}")
             result = result + " " + next_chunk
@@ -2120,9 +2183,12 @@ def cleanup_text(raw_text):
                 {"role": "user", "content": f"<transcript>\n{raw_text}\n</transcript>"},
             ],
             temperature=0.3,
-            max_tokens=min(2500, max(150, len(raw_text) // 2)),
+            max_tokens=min(2500, max(150, len(raw_text) // 2)) + _cleanup_headroom(),
+            extra_body=_cleanup_extra_body(),
         )
-        cleaned = response.choices[0].message.content.strip()
+        cleaned = (response.choices[0].message.content or "").strip()
+        if not cleaned:
+            raise ValueError("empty cleanup response")
         # Small models echo the tags and append notes like "(No changes needed)"
         m = re.search(r"<transcript>(.*?)</transcript>", cleaned, re.S)
         if m:

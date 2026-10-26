@@ -20,6 +20,10 @@ PRICING = {
         "input": 0.005,          # per 1K tokens
         "output": 0.015,         # per 1K tokens
     },
+    "openai/gpt-oss-20b": {
+        "input": 0.000075,       # per 1K tokens (Groq)
+        "output": 0.00030,       # per 1K tokens (Groq)
+    },
     "llama-3.1-8b-instant": {
         "input": 0.00005,        # per 1K tokens (Groq)
         "output": 0.00008,       # per 1K tokens (Groq)

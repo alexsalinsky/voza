@@ -70,13 +70,20 @@ if GROQ_API_KEY:
     API_KEY = GROQ_API_KEY
     API_BASE_URL = "https://api.groq.com/openai/v1"
     WHISPER_MODEL = "whisper-large-v3-turbo"
-    CLEANUP_MODEL = "llama-3.1-8b-instant"
+    # Groq retired llama-3.1-8b-instant (404 model_not_found), which silently
+    # broke cleanup and stitching. gpt-oss-20b is a reasoning model: keep the
+    # reasoning short and out of the reply, and leave token headroom for it.
+    CLEANUP_MODEL = "openai/gpt-oss-20b"
+    CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
+    CLEANUP_TOKEN_HEADROOM = 512
 else:
     API_PROVIDER = "openai"
     API_KEY = OPENAI_API_KEY
     API_BASE_URL = None  # OpenAI SDK default
     WHISPER_MODEL = "whisper-1"
     CLEANUP_MODEL = "gpt-4o-mini"
+    CLEANUP_EXTRA_BODY = {}
+    CLEANUP_TOKEN_HEADROOM = 0
 
 # ─── Transcription ───────────────────────────────────────────────────────────
 # "api"   → Cloud Whisper API (Groq or OpenAI, see above) — requires API key
