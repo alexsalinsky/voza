@@ -1556,6 +1556,7 @@ def _transcribe_api(wav_buf):
             ).strip()
         else:
             text = _strip_echo_text((response.text or "").strip(), "API")
+    text = _strip_repeat_loops(text, "API")
 
     # Track usage
     cost = usage.log_whisper_api_call(audio_seconds, config.WHISPER_MODEL)
@@ -1632,6 +1633,7 @@ def _transcribe_local(wav_buf):
     ]
     seg_list = _filter_echo_segments(seg_list, "LOCAL", audio_secs=audio_seconds)
     text = " ".join(d["text"].strip() for d in seg_list).strip()
+    text = _strip_repeat_loops(text, "LOCAL")
 
     dlog(f"[LOCAL] Engine: whisper-{config.LOCAL_WHISPER_MODEL} | {audio_seconds:.1f}s audio")
     # Track usage (free, but still track volume)
@@ -2137,6 +2139,64 @@ def _strip_echo_text(text, source):
              f"'{tail}' (no segment metadata)")
         return stripped
     return text
+
+
+def _prompt_terms():
+    """Normalized phrases from WHISPER_PROMPT and the custom vocab."""
+    terms = set()
+    for part in re.split(r"[,.;]", config.WHISPER_PROMPT or ""):
+        n = _normalize_match(part)
+        if n:
+            terms.add(n)
+    for w in load_custom_vocab():
+        n = _normalize_match(w)
+        if n:
+            terms.add(n)
+    return terms
+
+
+def _strip_repeat_loops(text, source):
+    """Remove Whisper's looping hallucination ("Claude, Claude, Claude, ...").
+
+    On silence or noise Whisper can repeat one word or short phrase over and
+    over, usually a word from the prompt. A prompt/vocab term said 3+ times in
+    a row is dropped entirely; any other phrase repeated 6+ times in a row is
+    collapsed to one. Real speech almost never does either."""
+    if not text:
+        return text
+    words = text.split()
+    norm = [_normalize_match(w) for w in words]
+    terms = _prompt_terms()
+    out = []
+    i = 0
+    changed = False
+    while i < len(words):
+        hit = None
+        for n in (1, 2, 3):
+            unit = norm[i:i + n]
+            if len(unit) < n or not all(unit):
+                continue
+            reps = 1
+            while norm[i + reps * n:i + (reps + 1) * n] == unit:
+                reps += 1
+            phrase = " ".join(unit)
+            if (phrase in terms and reps >= 3) or reps >= 6:
+                hit = (n, reps, phrase in terms)
+                break
+        if hit:
+            n, reps, is_term = hit
+            if not is_term:
+                out.extend(words[i + (reps - 1) * n:i + reps * n])
+            dlog(f"[ECHO-GUARD] {source}: {'dropped' if is_term else 'collapsed'} "
+                 f"'{' '.join(norm[i:i + n])}' repeated {reps}x")
+            i += reps * n
+            changed = True
+        else:
+            out.append(words[i])
+            i += 1
+    if not changed:
+        return text
+    return re.sub(r"\s+([,.;!?])", r"\1", " ".join(out)).strip(" ,;")
 
 
 def transcribe_file(path):
