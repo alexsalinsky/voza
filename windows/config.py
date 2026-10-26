@@ -88,6 +88,15 @@ TRANSCRIPTION_MODE = "api" if API_KEY else "local"
 API_FALLBACK_TO_LOCAL = True
 API_TIMEOUT_SECS = 60  # How long to wait for the API before falling back
 
+# Hedged fallback: if the API future has not resolved within this many seconds,
+# start a local transcription in parallel and take whichever finishes first.
+API_HEDGE_SECS = 10
+
+# Circuit breaker: after this many consecutive API failures, enter local-first
+# mode for API_BREAKER_COOLDOWN_SECS before retrying the API.
+API_BREAKER_FAILURES = 2
+API_BREAKER_COOLDOWN_SECS = 180
+
 # Whisper prompt hint — helps the model recognize uncommon words
 # Add names, jargon, or brand names that Whisper might mishear
 WHISPER_PROMPT = "Voza dictation."
