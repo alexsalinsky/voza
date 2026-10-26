@@ -184,13 +184,17 @@ else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Background chunking state
-chunk_results = []         # Ordered list of transcription futures/results
+chunk_results = []         # Ordered list of (future, wav_bytes) tuples
 chunk_executor = None      # Thread pool for background transcription
 chunk_frame_index = 0      # How many frames have been chunked so far
 
 # Optional: local whisper model (loaded lazily)
 local_whisper_model = None
 local_parakeet_model = None
+
+# Circuit breaker state (module-level, accessed from pipeline threads via lock)
+_api_consecutive_failures = 0
+_api_breaker_open_until = 0.0  # epoch seconds; 0 means breaker is closed
 
 # Session stats
 session_stats = {"dictations": 0, "total_seconds": 0, "start_time": None}
@@ -532,7 +536,9 @@ def _save_api_key(key):
         config.API_PROVIDER = "groq"
         config.API_BASE_URL = "https://api.groq.com/openai/v1"
         config.WHISPER_MODEL = "whisper-large-v3-turbo"
-        config.CLEANUP_MODEL = "llama-3.1-8b-instant"
+        config.CLEANUP_MODEL = "openai/gpt-oss-20b"
+        config.CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
+        config.CLEANUP_TOKEN_HEADROOM = 512
     else:
         config.OPENAI_API_KEY = key
         if config.API_PROVIDER != "groq":
@@ -793,7 +799,7 @@ def _build_status_window():
                 "Corrections",
                 "Fix words Voza keeps getting wrong (works with every engine).\n"
                 "Format: heard = meant, comma-separated.\n"
-                "Example: Maya = Maia, trello board = Trello board",
+                "Example: Maho = Majo, trello board = Trello board",
                 initialvalue=current,
                 parent=win,
             )
@@ -1124,30 +1130,63 @@ def mute_system_audio():
         if vol:
             _volume_was_muted = bool(vol.GetMute())
             vol.SetMute(1, None)
-            log(f"System audio muted (was already muted: {_volume_was_muted})")
+            dlog(f"[MUTE] muted (pre-state was_muted={_volume_was_muted})")
         else:
             # No blind fallback: toggling mute without knowing the current state
             # UNMUTES an already-muted machine and plays media over the mic.
-            log("Volume interface unavailable — leaving system audio untouched")
+            dlog("[MUTE] interface unavailable — leaving system audio untouched")
     except Exception as e:
-        log(f"Could not mute system audio: {e}")
+        dlog(f"[MUTE] FAILED: {type(e).__name__}: {e}")
 
 
 def unmute_system_audio():
-    """Restore system volume to what it was before recording."""
+    """Restore system volume to what it was before recording.
+
+    Intermittent COM failures in the process_dictation thread can leave the
+    machine stuck muted, so on any failure we retry once with a fresh COM init
+    and finally verify the readback. If verification shows we're still muted
+    when we shouldn't be, force one more SetMute(0)."""
     global _volume_was_muted
     if not config.MUTE_DURING_RECORDING:
         return
-    try:
+
+    target = 1 if _volume_was_muted else 0
+
+    def _attempt(tag):
         vol = _get_volume_interface()
-        if vol:
-            # Restore the pre-recording state: stays muted if it was muted before
-            vol.SetMute(1 if _volume_was_muted else 0, None)
-            log(f"System audio restored (muted: {_volume_was_muted})")
-        else:
-            log("Volume interface unavailable — leaving system audio untouched")
+        if vol is None:
+            dlog(f"[UNMUTE:{tag}] interface unavailable")
+            return None
+        vol.SetMute(target, None)
+        readback = bool(vol.GetMute())
+        dlog(f"[UNMUTE:{tag}] set target={target} readback_muted={readback}")
+        return readback
+
+    try:
+        readback = _attempt("try1")
     except Exception as e:
-        log(f"Could not unmute system audio: {e}")
+        dlog(f"[UNMUTE:try1] FAILED: {type(e).__name__}: {e}")
+        readback = None
+
+    if readback is None or readback != bool(target):
+        # Second attempt: force a fresh COM init on this thread and retry
+        try:
+            import comtypes
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+            try:
+                comtypes.CoInitialize()
+            except Exception:
+                pass
+            readback = _attempt("try2")
+        except Exception as e:
+            dlog(f"[UNMUTE:try2] FAILED: {type(e).__name__}: {e}")
+            readback = None
+
+    if readback is not None and readback != bool(target):
+        dlog(f"[UNMUTE] STILL WRONG after retries — readback={readback} target={target}")
 
 
 # ─── Audio Helpers ───────────────────────────────────────────────────────────
@@ -1169,11 +1208,49 @@ def _normalize_audio(audio_data):
     return audio_data
 
 
+def _trim_trailing_silence(audio_data, keep_secs=0.3):
+    """Trim trailing silence before transcription.
+
+    Quiet endings are what invite Whisper to echo the prompt tail (custom
+    vocab) as a hallucinated final segment. Walk back from the end in 20 ms
+    windows; drop everything after the last voiced window, keeping ~300 ms of
+    tail. Runs BEFORE normalization so the threshold sees the raw signal."""
+    if audio_data is None or audio_data.size == 0:
+        return audio_data
+    cols = audio_data.shape[1] if audio_data.ndim > 1 else None
+    flat = audio_data.reshape(-1)
+    thr = max(getattr(config, "SILENCE_THRESHOLD", 0.01), 1e-4)
+    win = max(1, int(0.02 * config.SAMPLE_RATE))
+    n = flat.size
+    idx = n
+    last_voiced = 0
+    while idx > 0:
+        s = max(0, idx - win)
+        if np.sqrt(np.mean(flat[s:idx] ** 2)) >= thr:
+            last_voiced = idx
+            break
+        idx = s
+    keep = int(keep_secs * config.SAMPLE_RATE)
+    end = min(n, (last_voiced + keep) if last_voiced > 0 else keep)
+    if end < n:
+        removed = (n - end) / config.SAMPLE_RATE
+        note = "all-silence audio" if last_voiced == 0 else "kept ~0.3s tail"
+        dlog(f"[TRIM] Trailing silence trimmed: {removed:.2f}s removed ({note})")
+        flat = flat[:end]
+    return flat.reshape(-1, cols) if cols else flat
+
+
 def frames_to_wav(frames):
     """Convert a list of float32 audio frames to an in-memory WAV BytesIO."""
     if not frames:
         return None
     audio_data = np.concatenate(frames, axis=0)
+    # All-silence audio never reaches the model — silence is what invites
+    # prompt-echo hallucinations ("En Blazes LLC, transferencia.").
+    if np.max(np.abs(audio_data)) < 0.003:
+        dlog("[TRIM] Entire audio is silence — skipping transcription")
+        return None
+    audio_data = _trim_trailing_silence(audio_data)
     audio_data = _normalize_audio(audio_data)
     audio_data = np.clip(audio_data, -1.0, 1.0)
     pcm = (audio_data * 32767).astype(np.int16)
@@ -1326,8 +1403,11 @@ def _chunk_watcher():
                 chunk_num = len(chunk_results) + 1
                 dlog(f"[CHUNKER] Sending chunk {chunk_num} ({duration:.1f}s + {OVERLAP_SECS}s overlap)")
                 log(f"Sending chunk {chunk_num} ({duration:.1f}s + {OVERLAP_SECS}s overlap)")
+                chunk_wav.seek(0)
+                chunk_wav_bytes = chunk_wav.read()
+                chunk_wav.seek(0)
                 future = chunk_executor.submit(_transcribe_chunk, chunk_wav, chunk_num)
-                chunk_results.append(future)
+                chunk_results.append((future, chunk_wav_bytes))
             else:
                 dlog(f"[CHUNKER] WARNING: frames_to_wav returned None for chunk")
 
@@ -1350,10 +1430,9 @@ def _transcribe_chunk(wav_buf, chunk_num):
         print(f"  [chunk {chunk_num}] ✓")
         return text
     except Exception as e:
-        dlog(f"[CHUNK {chunk_num}] FAILED: {e}")
-        log(f"Chunk {chunk_num} failed: {e}")
-        print(f"  [chunk {chunk_num}] ✗ {e}")
-        return ""
+        dlog(f"[CHUNK {chunk_num}] FAILED: {type(e).__name__}: {e}")
+        log(f"Chunk {chunk_num} failed: {type(e).__name__}: {e}")
+        print(f"  [chunk {chunk_num}] ✗ {type(e).__name__}: {e}")
         return ""
 
 
@@ -1396,6 +1475,12 @@ def _ensure_local_model():
         dlog("[LOCAL] Parakeet NOT available — fell back to whisper")
         config.LOCAL_ENGINE = "whisper"
 
+    _ensure_local_whisper()
+
+
+def _ensure_local_whisper():
+    """Load faster-whisper regardless of which engine is selected."""
+    global local_whisper_model
     if local_whisper_model is None:
         print("  Loading local Whisper model (first time may take a moment)...")
         from faster_whisper import WhisperModel
@@ -1413,9 +1498,9 @@ def transcribe_audio(wav_buf):
     try:
         return _transcribe_api(wav_buf)
     except Exception as e:
-        dlog(f"[TRANSCRIBE] API failed: {e}")
+        dlog(f"[TRANSCRIBE] API failed: {type(e).__name__}: {e}")
         if config.API_FALLBACK_TO_LOCAL:
-            print(f"  ⚠ API failed ({e}), falling back to local...")
+            print(f"  ⚠ API failed ({type(e).__name__}: {e}), falling back to local...")
             beep(config.SOUND_ERROR)
             try:
                 wav_buf.seek(0)
@@ -1446,10 +1531,13 @@ def _transcribe_api(wav_buf):
     dlog(f"[API] Audio segment: {audio_seconds:.1f}s")
 
     wav_buf.name = "audio.wav"
+    # verbose_json gives per-segment no_speech_prob / avg_logprob, which the
+    # echo guard needs to tell a prompt-echo hallucination from a genuine
+    # mention of a custom vocab word.
     kwargs = dict(
         model=config.WHISPER_MODEL,
         file=wav_buf,
-        response_format="text",
+        response_format="verbose_json",
         timeout=config.API_TIMEOUT_SECS,
     )
     if config.WHISPER_PROMPT:
@@ -1457,7 +1545,17 @@ def _transcribe_api(wav_buf):
     if lang != "auto":
         kwargs["language"] = lang
     response = client.audio.transcriptions.create(**kwargs)
-    text = response.strip() if isinstance(response, str) else response.text.strip()
+    if isinstance(response, str):
+        text = _strip_echo_text(response.strip(), "API")
+    else:
+        segments = getattr(response, "segments", None) or []
+        if segments:
+            kept = _filter_echo_segments(segments, "API", audio_secs=audio_seconds)
+            text = " ".join(
+                (_seg_field(s, "text") or "").strip() for s in kept
+            ).strip()
+        else:
+            text = _strip_echo_text((response.text or "").strip(), "API")
 
     # Track usage
     cost = usage.log_whisper_api_call(audio_seconds, config.WHISPER_MODEL)
@@ -1467,7 +1565,14 @@ def _transcribe_api(wav_buf):
 
 def _transcribe_local(wav_buf):
     """Use the local engine (Parakeet or faster-whisper)."""
-    _ensure_local_model()
+    # Parakeet is auto-detect only — a forced language (ctrl+shift+l) routes
+    # this dictation to whisper, which honors the language setting.
+    forced_lang = config.LANGUAGE != "auto"
+    if config.LOCAL_ENGINE == "parakeet" and forced_lang:
+        dlog(f"[LOCAL] Language forced to '{config.LANGUAGE}' — routing to whisper")
+        _ensure_local_whisper()
+    else:
+        _ensure_local_model()
 
     # Estimate audio duration for tracking
     try:
@@ -1479,9 +1584,8 @@ def _transcribe_local(wav_buf):
     except Exception:
         audio_seconds = 0
 
-    if config.LOCAL_ENGINE == "parakeet" and local_parakeet_model is not None:
-        # Parakeet auto-detects language; the forced-language setting only
-        # applies to the Whisper engines.
+    if (config.LOCAL_ENGINE == "parakeet" and not forced_lang
+            and local_parakeet_model is not None):
         import wave as _wave
         import numpy as _np
         wav_buf.seek(0)
@@ -1505,13 +1609,29 @@ def _transcribe_local(wav_buf):
     tmp.close()
 
     lang = config.LANGUAGE
-    transcribe_kwargs = dict(beam_size=5)
+    # Custom vocab goes in `hotwords` (vocabulary biasing without prompt echo);
+    # only the base prompt stays in initial_prompt. vad_filter keeps trailing
+    # silence from ever reaching the model.
+    transcribe_kwargs = dict(
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
+    )
     if lang != "auto":
         transcribe_kwargs["language"] = lang
-    if config.WHISPER_PROMPT:
-        transcribe_kwargs["initial_prompt"] = config.WHISPER_PROMPT
+    if _BASE_WHISPER_PROMPT:
+        transcribe_kwargs["initial_prompt"] = _BASE_WHISPER_PROMPT
+    vocab_words = load_custom_vocab()
+    if vocab_words:
+        transcribe_kwargs["hotwords"] = ", ".join(vocab_words)
     segments, _ = local_whisper_model.transcribe(tmp.name, **transcribe_kwargs)
-    text = " ".join(seg.text for seg in segments).strip()
+    seg_list = [
+        {"text": seg.text, "no_speech_prob": seg.no_speech_prob,
+         "avg_logprob": seg.avg_logprob, "start": seg.start}
+        for seg in segments
+    ]
+    seg_list = _filter_echo_segments(seg_list, "LOCAL", audio_secs=audio_seconds)
+    text = " ".join(d["text"].strip() for d in seg_list).strip()
 
     dlog(f"[LOCAL] Engine: whisper-{config.LOCAL_WHISPER_MODEL} | {audio_seconds:.1f}s audio")
     # Track usage (free, but still track volume)
@@ -1522,7 +1642,145 @@ def _transcribe_local(wav_buf):
     return text
 
 
+def _resolve_with_hedge(api_future, wav_bytes, label):
+    """Wait on api_future. If it takes longer than API_HEDGE_SECS, start local
+    transcription in parallel and return whichever result arrives first.
+
+    Also maintains the circuit breaker:
+    - Two consecutive API failures open the breaker for API_BREAKER_COOLDOWN_SECS.
+    - While the breaker is open, local transcription runs immediately without
+      waiting the hedge delay; the API call fires in background for recovery
+      detection only.
+    - A successful API result resets the consecutive-failure counter.
+
+    wav_bytes: bytes of the WAV audio (not a BytesIO) so both code paths can
+    read independently.
+    label: short string used in log messages (e.g. "Chunk 2" or "Final").
+    Returns the transcribed text (may be empty string on full failure).
+    """
+    import io as _io
+    global _api_consecutive_failures, _api_breaker_open_until
+
+    hedge_secs = getattr(config, 'API_HEDGE_SECS', 10)
+    breaker_failures = getattr(config, 'API_BREAKER_FAILURES', 2)
+    breaker_cooldown = getattr(config, 'API_BREAKER_COOLDOWN_SECS', 180)
+
+    breaker_open = (time.time() < _api_breaker_open_until)
+
+    def make_local_buf():
+        return _io.BytesIO(wav_bytes)
+
+    local_future = None
+    local_executor = None
+
+    if breaker_open:
+        # Local-first: start local immediately, still fire API to detect recovery.
+        dlog(f'[FALLBACK] {label}: circuit breaker OPEN, local-first mode')
+        local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        local_future = local_executor.submit(_transcribe_local, make_local_buf())
+
+    # Poll: wait on API future with short intervals so we can start hedge.
+    deadline_hedge = time.time() + (0 if breaker_open else hedge_secs)
+    api_text = None
+    api_done = False
+    hedge_started = breaker_open  # already started if breaker open
+
+    while True:
+        remaining = deadline_hedge - time.time()
+        wait = max(0.0, min(0.5, remaining)) if not hedge_started else 0.5
+        try:
+            api_text = api_future.result(timeout=wait)
+            api_done = True
+            break
+        except concurrent.futures.TimeoutError:
+            pass
+        except Exception as exc:
+            dlog(f'[FALLBACK] {label}: API raised {type(exc).__name__}: {exc}')
+            api_done = True
+            break
+
+        if not hedge_started and time.time() >= deadline_hedge:
+            dlog(f'[FALLBACK] {label}: API slow (>{hedge_secs}s), starting local hedge')
+            hedge_started = True
+            local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            local_future = local_executor.submit(_transcribe_local, make_local_buf())
+
+        if local_future is not None:
+            try:
+                local_text = local_future.result(timeout=0)
+                # Local finished first.
+                dlog(f'[FALLBACK] {label}: local result won the race')
+                with lock:
+                    _api_consecutive_failures = min(
+                        _api_consecutive_failures + (0 if not api_done else 1),
+                        breaker_failures,
+                    )
+                if local_executor:
+                    local_executor.shutdown(wait=False)
+                return local_text or ''
+            except concurrent.futures.TimeoutError:
+                pass
+            except Exception as loc_exc:
+                dlog(f'[FALLBACK] {label}: local raised {type(loc_exc).__name__}: {loc_exc}')
+                if local_executor:
+                    local_executor.shutdown(wait=False)
+                local_future = None
+
+        if api_done:
+            break
+
+    # API finished (success or error).
+    if api_done and api_text is not None:
+        dlog(f'[FALLBACK] {label}: API result arrived first')
+        with lock:
+            if _api_consecutive_failures > 0:
+                _api_consecutive_failures = 0
+                dlog(f'[FALLBACK] circuit breaker reset, API healthy')
+            _api_breaker_open_until = 0.0
+        if local_executor:
+            local_executor.shutdown(wait=False)
+        return api_text
+
+    # API failed/timed out. Count the failure.
+    with lock:
+        _api_consecutive_failures += 1
+        failures_now = _api_consecutive_failures
+        if failures_now >= breaker_failures and _api_breaker_open_until <= time.time():
+            _api_breaker_open_until = time.time() + breaker_cooldown
+            dlog(
+                f'[FALLBACK] circuit breaker OPEN ({failures_now} consecutive API failures),'
+                f' local-first for {breaker_cooldown}s'
+            )
+
+    # Fall back to local (may already be running).
+    if local_future is None:
+        dlog(f'[FALLBACK] {label}: API failed, starting local fallback')
+        local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        local_future = local_executor.submit(_transcribe_local, make_local_buf())
+    else:
+        dlog(f'[FALLBACK] {label}: API failed, waiting for in-progress local')
+
+    try:
+        local_text = local_future.result(timeout=120)
+        if local_executor:
+            local_executor.shutdown(wait=False)
+        return local_text or ''
+    except Exception as loc_exc:
+        dlog(f'[FALLBACK] {label}: local also failed: {type(loc_exc).__name__}: {loc_exc}')
+        if local_executor:
+            local_executor.shutdown(wait=False)
+        return ''
+
+
 # ─── Stitching ───────────────────────────────────────────────────────────────
+def _cleanup_extra_body():
+    return getattr(config, "CLEANUP_EXTRA_BODY", None) or None
+
+
+def _cleanup_headroom():
+    return getattr(config, "CLEANUP_TOKEN_HEADROOM", 0)
+
+
 def stitch_chunks(chunk_texts):
     """Merge overlapping chunk transcriptions into clean, continuous text.
     Tries GPT first for smart de-duplication, falls back to local stitching."""
@@ -1542,9 +1800,12 @@ def stitch_chunks(chunk_texts):
                 {"role": "user", "content": numbered},
             ],
             temperature=0.2,
-            max_tokens=min(4000, max(300, len(numbered) // 2)),
+            max_tokens=min(4000, max(300, len(numbered) // 2)) + _cleanup_headroom(),
+            extra_body=_cleanup_extra_body(),
         )
-        result = response.choices[0].message.content.strip()
+        result = (response.choices[0].message.content or "").strip()
+        if not result:
+            raise ValueError("empty stitch response")
 
         # Guard: stitched output can't exceed the combined chunks. If it grew,
         # the model answered the dictation content instead of stitching it.
@@ -1590,6 +1851,58 @@ def _stitch_claude(chunk_texts):
         return _stitch_local(chunk_texts)
 
 
+def _stitch_word(w):
+    """Normalize one word for overlap matching: case and punctuation don't count."""
+    return "".join(ch for ch in w.lower() if ch.isalnum())
+
+
+def _stitch_words_match(a, b):
+    if a == b:
+        return True
+    # Tolerate small spelling drift between chunks ("Voza" vs "Vosa")
+    if len(a) >= 4 and len(b) >= 4:
+        import difflib
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
+    return False
+
+
+def _find_chunk_overlap(result_words, next_words):
+    """Find where the next chunk's audio overlap repeats the end of the result.
+
+    Each chunk starts with ~OVERLAP_SECS of audio already transcribed at the
+    end of the previous one. Whisper rarely transcribes that stretch the same
+    way twice: punctuation and capitals change ("desktop. So" vs "desktop, so"),
+    and the words at either cut edge can be clipped or dropped. So match on
+    normalized words, let up to 3 leading words of the next chunk and up to 4
+    trailing words of the result fall outside the match, and take the longest
+    run. Returns (length, drop_tail, skip_head) or None.
+    """
+    a = [_stitch_word(w) for w in result_words]
+    b = [_stitch_word(w) for w in next_words]
+    best = None  # (length, -(skip+drop), drop, skip)
+    for skip in range(0, min(4, len(b))):
+        for drop in range(0, min(5, len(a))):
+            max_len = min(30, len(a) - drop, len(b) - skip)
+            for length in range(max_len, 0, -1):
+                # Short matches only count when they sit right at the seam
+                if (length < 3 and skip + drop > 1) or (length == 1 and skip + drop > 0):
+                    break
+                tail = a[len(a) - drop - length:len(a) - drop]
+                head = b[skip:skip + length]
+                misses = sum(1 for x, y in zip(tail, head) if not _stitch_words_match(x, y))
+                if misses == 0 or (length >= 6 and misses == 1):
+                    cand = (length, -(skip + drop), drop, skip)
+                    if best is None or cand > best:
+                        best = cand
+                    break
+    if best is None:
+        # A word clipped at the cut ("compl") that the next chunk heard whole
+        if a and b and len(a[-1]) >= 3 and b[0].startswith(a[-1]) and b[0] != a[-1]:
+            return 0, 1, 0
+        return None
+    return best[0], best[2], best[3]
+
+
 def _stitch_local(chunk_texts):
     """Simple local stitching: find overlapping words between consecutive chunks
     and remove duplicates. No API needed."""
@@ -1598,21 +1911,19 @@ def _stitch_local(chunk_texts):
     result = chunk_texts[0]
     for i in range(1, len(chunk_texts)):
         next_chunk = chunk_texts[i]
-        # Try to find overlap: check if the end of the current result
-        # matches the beginning of the next chunk
         result_words = result.split()
         next_words = next_chunk.split()
-        best_overlap = 0
-        # Check overlap windows from 3 to 30 words
-        for overlap_len in range(min(30, len(result_words), len(next_words)), 2, -1):
-            tail = " ".join(result_words[-overlap_len:]).lower().strip(".,!? ")
-            head = " ".join(next_words[:overlap_len]).lower().strip(".,!? ")
-            if tail == head:
-                best_overlap = overlap_len
-                break
-        if best_overlap > 0:
-            dlog(f"[STITCH] Found {best_overlap}-word overlap between chunk {i} and {i+1}")
-            result = result + " " + " ".join(next_words[best_overlap:])
+        found = _find_chunk_overlap(result_words, next_words)
+        if found:
+            length, drop, skip = found
+            # The next chunk heard the seam in full, so its version wins:
+            # drop the result's clipped tail words and the repeated head.
+            kept = result_words[:len(result_words) - drop]
+            if length:
+                # Seam punctuation comes from the chunk that heard what followed
+                kept[-1] = next_words[skip + length - 1]
+            dlog(f"[STITCH] Found {length}-word overlap between chunk {i} and {i+1} (skip {skip}, drop {drop})")
+            result = " ".join(kept + next_words[skip + length:])
         else:
             dlog(f"[STITCH] No overlap found, concatenating chunk {i+1}")
             result = result + " " + next_chunk
@@ -1712,6 +2023,143 @@ def is_hallucination(text):
     return False
 
 
+# ─── Prompt-echo guard ───────────────────────────────────────────────────────
+# On quiet endings Whisper sometimes echoes the tail of its prompt (which
+# carries the custom vocabulary) as a hallucinated final segment, e.g.
+# "En Blazes LLC, transferencia." appended to real transcripts. The guard
+# strips trailing segments that fuzzily match the vocab/prompt tail AND have
+# weak acoustic support (high no_speech_prob or low avg_logprob). A genuine
+# spoken mention of a vocab word has solid acoustics and is kept. Every strip
+# is logged to voza_debug.log as [ECHO-GUARD] so false positives are visible.
+
+def _normalize_match(s):
+    s = (s or "").lower()
+    s = re.sub(r"[\W_]+", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _fuzzy_ratio(a, b):
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _echo_candidates():
+    """Strings whose appearance as the final segment suggests prompt echo."""
+    words = load_custom_vocab()
+    cands = []
+    if words:
+        cands.append(", ".join(words))   # the exact prompt tail
+        cands.extend(words)              # each vocab phrase alone
+    prompt = config.WHISPER_PROMPT or ""
+    tail = " ".join(prompt.split()[-6:])
+    if tail:
+        cands.append(tail)
+    return [c for c in cands if len(_normalize_match(c)) >= 4]
+
+
+def _match_echo(seg_text):
+    """Return the matched candidate if seg_text is (mostly) a vocab/prompt echo
+    anchored at its end, else None."""
+    norm = _normalize_match(seg_text)
+    if not norm:
+        return None
+    for cand in _echo_candidates():
+        cn = _normalize_match(cand)
+        tail = norm[-len(cn):]
+        # The segment must be essentially the echo itself, not a real sentence
+        # that happens to end with a vocab word.
+        if _fuzzy_ratio(tail, cn) >= 0.85 and len(norm) <= len(cn) + 8:
+            return cand
+    return None
+
+
+def _seg_field(seg, name):
+    if isinstance(seg, dict):
+        return seg.get(name)
+    return getattr(seg, name, None)
+
+
+def _filter_echo_segments(segments, source, audio_secs=None):
+    """Drop trailing segments that echo the vocab/prompt with weak support.
+
+    Weak support = high no_speech_prob, low avg_logprob, or (the reliable one
+    on Groq, whose turbo model reports no_speech=0.0 even for hallucinations)
+    a timing impossibility: the matched phrase starting inside the last second
+    of audio, where there is no room to actually say it."""
+    kept = list(segments)
+    while kept:
+        seg = kept[-1]
+        text = (_seg_field(seg, "text") or "").strip()
+        cand = _match_echo(text)
+        if cand is None:
+            break
+        nsp = _seg_field(seg, "no_speech_prob")
+        alp = _seg_field(seg, "avg_logprob")
+        start = _seg_field(seg, "start")
+        if nsp is None and alp is None and start is None:
+            weak = True  # no metadata: end-anchored match is the only signal
+        else:
+            weak = (nsp is not None and nsp > 0.5) or (alp is not None and alp < -0.7)
+            if audio_secs:
+                if audio_secs < 1.0:
+                    weak = True  # clip too short to contain the phrase at all
+                elif start is not None and (audio_secs - start) < 1.0:
+                    weak = True  # phrase "starts" in the trailing tail
+        if not weak:
+            dlog(f"[ECHO-GUARD] {source}: final segment matches vocab ('{cand}') "
+                 f"but acoustics are solid (no_speech={nsp}, logprob={alp}) — keeping")
+            break
+        dlog(f"[ECHO-GUARD] {source}: STRIPPED trailing echo segment '{text}' "
+             f"(matched '{cand}', no_speech={nsp}, logprob={alp})")
+        kept.pop()
+    return kept
+
+
+def _strip_echo_text(text, source):
+    """Text-only fallback when no segment metadata exists: strip only the full
+    joined vocab tail (e.g. 'En Blazes LLC, transferencia') anchored at the
+    very end. Single-phrase matches are left alone here to protect genuine
+    mentions."""
+    words = load_custom_vocab()
+    if not text or not words:
+        return text
+    seq_norm = _normalize_match(", ".join(words))
+    if len(seq_norm) < 4:
+        return text
+    toks = text.split()
+    n_seq = len(seq_norm.split())
+    if len(toks) < n_seq:
+        return text
+    tail = " ".join(toks[-n_seq:])
+    if _fuzzy_ratio(_normalize_match(tail), seq_norm) >= 0.85:
+        stripped = " ".join(toks[:-n_seq]).rstrip(" ,;")
+        dlog(f"[ECHO-GUARD] {source}: STRIPPED trailing vocab-echo text "
+             f"'{tail}' (no segment metadata)")
+        return stripped
+    return text
+
+
+def transcribe_file(path):
+    """Transcribe a WAV file through the same pipeline as a live dictation
+    (silence trim → transcribe with echo guard → hallucination filter).
+    Test entry point — no microphone needed. Expects a 16 kHz mono WAV."""
+    with wave.open(path, "rb") as wf:
+        if wf.getframerate() != config.SAMPLE_RATE:
+            raise ValueError(
+                f"Expected {config.SAMPLE_RATE} Hz WAV, got {wf.getframerate()}")
+        data = np.frombuffer(
+            wf.readframes(wf.getnframes()), dtype=np.int16
+        ).astype(np.float32) / 32768.0
+    buf = frames_to_wav([data.reshape(-1, 1)])
+    if buf is None:
+        return ""
+    text = (transcribe_audio(buf) or "").strip()
+    if is_hallucination(text):
+        dlog(f"[TEST] transcribe_file: dropped hallucination '{text[:60]}'")
+        return ""
+    return text
+
+
 # ─── Cleanup with GPT ────────────────────────────────────────────────────────
 def cleanup_text(raw_text):
     """Send raw transcription through GPT (or Claude fallback) for light cleanup."""
@@ -1735,9 +2183,12 @@ def cleanup_text(raw_text):
                 {"role": "user", "content": f"<transcript>\n{raw_text}\n</transcript>"},
             ],
             temperature=0.3,
-            max_tokens=min(2500, max(150, len(raw_text) // 2)),
+            max_tokens=min(2500, max(150, len(raw_text) // 2)) + _cleanup_headroom(),
+            extra_body=_cleanup_extra_body(),
         )
-        cleaned = response.choices[0].message.content.strip()
+        cleaned = (response.choices[0].message.content or "").strip()
+        if not cleaned:
+            raise ValueError("empty cleanup response")
         # Small models echo the tags and append notes like "(No changes needed)"
         m = re.search(r"<transcript>(.*?)</transcript>", cleaned, re.S)
         if m:
@@ -1874,6 +2325,7 @@ def process_dictation():
         remaining_frames = audio_frames[chunk_frame_index:]
         remaining_duration = frames_duration_secs(remaining_frames)
         remaining_future = None
+        final_wav = None
 
         dlog(f"[PIPELINE] chunk_frame_index={chunk_frame_index}, chunk_results={len(chunk_results)}, remaining_duration={remaining_duration:.2f}s")
 
@@ -1907,17 +2359,32 @@ def process_dictation():
 
         # --- Collect already-completed background chunks ---
         # (these were transcribing while we were still talking, so most are done)
+        # Each entry in chunk_results is (future, wav_bytes).
+        # Use _resolve_with_hedge so slow API calls trigger a local fallback race.
         completed_texts = []
-        for i, future in enumerate(chunk_results):
+        for i, (future, chunk_wav_bytes) in enumerate(chunk_results):
             try:
-                text = future.result(timeout=30)
+                # Peek: if the chunk future is already done, grab it without going
+                # through the hedge machinery (fast path for the common case).
+                try:
+                    text = future.result(timeout=0)
+                    if text and text.strip():
+                        completed_texts.append(text.strip())
+                        dlog(f"[PIPELINE] Chunk {i}: '{text.strip()[:60]}...'")
+                    else:
+                        dlog(f"[PIPELINE] Chunk {i}: empty result")
+                    continue
+                except concurrent.futures.TimeoutError:
+                    pass  # not done yet; fall through to hedge
+                # Chunk is still in flight: wait with hedge fallback.
+                text = _resolve_with_hedge(future, chunk_wav_bytes, f"Chunk {i}")
                 if text and text.strip():
                     completed_texts.append(text.strip())
                     dlog(f"[PIPELINE] Chunk {i}: '{text.strip()[:60]}...'")
                 else:
-                    dlog(f"[PIPELINE] Chunk {i}: empty result")
+                    dlog(f"[PIPELINE] Chunk {i}: empty result (after hedge)")
             except Exception as e:
-                dlog(f"[PIPELINE] Chunk {i} FAILED: {e}")
+                dlog(f"[PIPELINE] Chunk {i} FAILED: {type(e).__name__}: {e}")
 
         # --- Now collect the remaining segment (was transcribing in parallel) ---
         if remaining_future is not None:
@@ -1925,14 +2392,20 @@ def process_dictation():
                 # Longer timeout for long recordings — 30s base + 1s per 10s of audio
                 api_timeout = max(30, int(total_duration / 10) + 30)
                 dlog(f"[PIPELINE] Waiting for final segment (timeout={api_timeout}s)...")
-                final_text = remaining_future.result(timeout=api_timeout)
+                if final_wav is not None:
+                    final_wav.seek(0)
+                    final_wav_bytes = final_wav.read()
+                    final_wav.seek(0)
+                else:
+                    final_wav_bytes = b''
+                final_text = _resolve_with_hedge(remaining_future, final_wav_bytes, "Final")
                 if final_text and final_text.strip():
                     completed_texts.append(final_text.strip())
                     dlog(f"[PIPELINE] Final segment: '{final_text.strip()[:60]}...'")
                 else:
-                    dlog(f"[PIPELINE] Final segment: empty result")
+                    dlog(f"[PIPELINE] Final segment: empty result (after hedge)")
             except Exception as e:
-                dlog(f"[PIPELINE] Final segment FAILED: {e}")
+                dlog(f"[PIPELINE] Final segment FAILED: {type(e).__name__}: {e}")
 
         if not completed_texts:
             dlog(f"[PIPELINE] No transcription results at all — nothing to paste")

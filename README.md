@@ -128,7 +128,7 @@ For advanced configuration, edit `config.py`.
 
 - **Python 3.10+**
 - **Whisper via Groq or OpenAI**, or **faster-whisper** / **NVIDIA Parakeet v3** (sherpa-onnx) for local speech-to-text
-- **llama-3.1-8b-instant** (Groq) or **GPT-4o-mini** (OpenAI) for optional text cleanup
+- **gpt-oss-20b** (Groq) or **GPT-4o-mini** (OpenAI) for optional text cleanup
 - **sounddevice** for audio capture
 - **pystray + Pillow** for system tray
 - **tkinter** for settings UI

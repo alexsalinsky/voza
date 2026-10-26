@@ -70,13 +70,20 @@ if GROQ_API_KEY:
     API_KEY = GROQ_API_KEY
     API_BASE_URL = "https://api.groq.com/openai/v1"
     WHISPER_MODEL = "whisper-large-v3-turbo"
-    CLEANUP_MODEL = "llama-3.1-8b-instant"
+    # Groq retired llama-3.1-8b-instant (404 model_not_found), which silently
+    # broke cleanup and stitching. gpt-oss-20b is a reasoning model: keep the
+    # reasoning short and out of the reply, and leave token headroom for it.
+    CLEANUP_MODEL = "openai/gpt-oss-20b"
+    CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
+    CLEANUP_TOKEN_HEADROOM = 512
 else:
     API_PROVIDER = "openai"
     API_KEY = OPENAI_API_KEY
     API_BASE_URL = None  # OpenAI SDK default
     WHISPER_MODEL = "whisper-1"
     CLEANUP_MODEL = "gpt-4o-mini"
+    CLEANUP_EXTRA_BODY = {}
+    CLEANUP_TOKEN_HEADROOM = 0
 
 # ─── Transcription ───────────────────────────────────────────────────────────
 # "api"   → Cloud Whisper API (Groq or OpenAI, see above) — requires API key
@@ -87,6 +94,15 @@ TRANSCRIPTION_MODE = "api" if API_KEY else "local"
 # Auto-fallback: if API fails (offline, timeout, etc.), try local transcription
 API_FALLBACK_TO_LOCAL = True
 API_TIMEOUT_SECS = 60  # How long to wait for the API before falling back
+
+# Hedged fallback: if the API future has not resolved within this many seconds,
+# start a local transcription in parallel and take whichever finishes first.
+API_HEDGE_SECS = 10
+
+# Circuit breaker: after this many consecutive API failures, enter local-first
+# mode for API_BREAKER_COOLDOWN_SECS before retrying the API.
+API_BREAKER_FAILURES = 2
+API_BREAKER_COOLDOWN_SECS = 180
 
 # Whisper prompt hint — helps the model recognize uncommon words
 # Add names, jargon, or brand names that Whisper might mishear
