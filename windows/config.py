@@ -101,12 +101,16 @@ API_TIMEOUT_SECS = 60  # How long to wait for the API before falling back
 
 # Hedged fallback: if the API future has not resolved within this many seconds,
 # start a local transcription in parallel and take whichever finishes first.
-API_HEDGE_SECS = 10
+API_HEDGE_SECS = 4  # Groq normally answers in ~1s
 
 # Circuit breaker: after this many consecutive API failures, enter local-first
 # mode for API_BREAKER_COOLDOWN_SECS before retrying the API.
 API_BREAKER_FAILURES = 2
 API_BREAKER_COOLDOWN_SECS = 180
+
+# Total seconds cleanup or stitching may spend across all LLM fallbacks
+# before Voza pastes the text without them
+LLM_BUDGET_SECS = 6
 
 # Whisper prompt hint — helps the model recognize uncommon words
 # Add names, jargon, or brand names that Whisper might mishear

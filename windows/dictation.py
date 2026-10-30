@@ -1646,6 +1646,24 @@ def _transcribe_local(wav_buf):
     return text
 
 
+def _count_api_failure(breaker_failures, breaker_cooldown, kind):
+    """Count one failed or too-slow API call; open the breaker at the limit."""
+    global _api_consecutive_failures, _api_breaker_open_until
+    with lock:
+        _api_consecutive_failures += 1
+        failures_now = _api_consecutive_failures
+        if failures_now >= breaker_failures and _api_breaker_open_until <= time.time():
+            _api_breaker_open_until = time.time() + breaker_cooldown
+            dlog(
+                f'[FALLBACK] circuit breaker OPEN ({failures_now} consecutive API calls'
+                f' failed or slow, last {kind}), local-first for {breaker_cooldown}s'
+            )
+
+
+def _api_breaker_is_open():
+    return time.time() < _api_breaker_open_until
+
+
 def _resolve_with_hedge(api_future, wav_bytes, label):
     """Wait on api_future. If it takes longer than API_HEDGE_SECS, start local
     transcription in parallel and return whichever result arrives first.
@@ -1714,11 +1732,12 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
                 local_text = local_future.result(timeout=0)
                 # Local finished first.
                 dlog(f'[FALLBACK] {label}: local result won the race')
-                with lock:
-                    _api_consecutive_failures = min(
-                        _api_consecutive_failures + (0 if not api_done else 1),
-                        breaker_failures,
-                    )
+                if not breaker_open:
+                    # A hedge win means the API was too slow to use, which
+                    # costs the user as much as an error: count it, so a
+                    # stalling provider trips local-first mode instead of
+                    # adding the hedge delay to every dictation.
+                    _count_api_failure(breaker_failures, breaker_cooldown, "slow")
                 if local_executor:
                     local_executor.shutdown(wait=False)
                 return local_text or ''
@@ -1746,15 +1765,7 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
         return api_text
 
     # API failed/timed out. Count the failure.
-    with lock:
-        _api_consecutive_failures += 1
-        failures_now = _api_consecutive_failures
-        if failures_now >= breaker_failures and _api_breaker_open_until <= time.time():
-            _api_breaker_open_until = time.time() + breaker_cooldown
-            dlog(
-                f'[FALLBACK] circuit breaker OPEN ({failures_now} consecutive API failures),'
-                f' local-first for {breaker_cooldown}s'
-            )
+    _count_api_failure(breaker_failures, breaker_cooldown, "failed")
 
     # Fall back to local (may already be running).
     if local_future is None:
@@ -2315,7 +2326,9 @@ def _fallback_client(name):
 def _llm_chain():
     """(client getter, model, extra_body, token headroom), best first."""
     chain = []
-    if client is not None and config.API_KEY:
+    # While the transcription API is failing or stalling, its provider's chat
+    # models usually are too: skip them rather than wait on them
+    if client is not None and config.API_KEY and not _api_breaker_is_open():
         for model in [config.CLEANUP_MODEL] + list(getattr(config, "CLEANUP_FALLBACK_MODELS", [])):
             chain.append((lambda: client, model, _cleanup_extra_body(), _cleanup_headroom()))
     if config.OPENAI_API_KEY and config.API_PROVIDER != "openai":
@@ -2328,11 +2341,18 @@ def _llm_chain():
 def _llm_complete(system, user, max_tokens, temperature, purpose):
     """Run one chat completion down the chain. Returns (text, model)."""
     errors = []
+    # The whole chain shares one time budget: the paste is waiting, and
+    # unchecked text now beats checked text in 20 seconds
+    deadline = time.time() + getattr(config, "LLM_BUDGET_SECS", 6)
     for get_client, model, extra, headroom in _llm_chain():
+        remaining = deadline - time.time()
+        if remaining < 0.5:
+            errors.append(f"{model}: skipped, out of time")
+            break
         try:
             # max_retries=0: a rate-limited call should move down the chain
             # at once, not sleep 10-20s in SDK backoff while the paste waits
-            response = get_client().with_options(max_retries=0, timeout=20).chat.completions.create(
+            response = get_client().with_options(max_retries=0, timeout=remaining).chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}],
@@ -2357,8 +2377,11 @@ def _llm_complete(system, user, max_tokens, temperature, purpose):
                 _llm_warn(f"A text-cleanup model was retired, so Voza is using {model} instead. "
                           f"Update CLEANUP_MODEL in config.py.")
         return text, model
-    _llm_warn("Text cleanup is offline: every model failed, so dictations are pasted "
-              "unchecked. Details in voza_debug.log.")
+    if any("out of time" in x or "Timeout" in x for x in errors):
+        dlog(f"[LLM] {purpose}: out of time, pasting without it")
+    else:
+        _llm_warn("Text cleanup is offline: every model failed, so dictations are pasted "
+                  "unchecked. Details in voza_debug.log.")
     raise RuntimeError("; ".join(errors) or "no LLM configured")
 
 
