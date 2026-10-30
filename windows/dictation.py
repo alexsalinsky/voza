@@ -194,6 +194,7 @@ local_parakeet_model = None
 # Circuit breaker state (module-level, accessed from pipeline threads via lock)
 _api_consecutive_failures = 0
 _api_breaker_open_until = 0.0  # epoch seconds; 0 means breaker is closed
+_api_slow_at = 0.0  # epoch seconds of the last failed or too-slow API call
 
 # Session stats
 session_stats = {"dictations": 0, "total_seconds": 0, "start_time": None}
@@ -1658,8 +1659,9 @@ def _transcribe_local(wav_buf):
 
 def _count_api_failure(breaker_failures, breaker_cooldown, kind):
     """Count one failed or too-slow API call; open the breaker at the limit."""
-    global _api_consecutive_failures, _api_breaker_open_until
+    global _api_consecutive_failures, _api_breaker_open_until, _api_slow_at
     with lock:
+        _api_slow_at = time.time()
         _api_consecutive_failures += 1
         failures_now = _api_consecutive_failures
         if failures_now >= breaker_failures and _api_breaker_open_until <= time.time():
@@ -1670,8 +1672,24 @@ def _count_api_failure(breaker_failures, breaker_cooldown, kind):
             )
 
 
+def _api_healthy():
+    """An API answer arrived in time: close the breaker, clear the slow flag."""
+    global _api_consecutive_failures, _api_breaker_open_until, _api_slow_at
+    with lock:
+        if _api_consecutive_failures > 0:
+            _api_consecutive_failures = 0
+            dlog(f'[FALLBACK] circuit breaker reset, API healthy')
+        _api_breaker_open_until = 0.0
+        _api_slow_at = 0.0
+
+
 def _api_breaker_is_open():
     return time.time() < _api_breaker_open_until
+
+
+def _network_is_slow():
+    """Breaker open, or an API call missed its window in the last minute."""
+    return _api_breaker_is_open() or time.time() - _api_slow_at < 60
 
 
 def _resolve_with_hedge(api_future, wav_bytes, label):
@@ -1719,7 +1737,7 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
 
     while True:
         remaining = deadline_hedge - time.time()
-        wait = max(0.0, min(0.5, remaining)) if not hedge_started else 0.5
+        wait = max(0.0, min(0.5, remaining)) if not hedge_started else 0.1
         try:
             api_text = api_future.result(timeout=wait)
             api_done = True
@@ -1732,7 +1750,8 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
             break
 
         if not hedge_started and time.time() >= deadline_hedge:
-            dlog(f'[FALLBACK] {label}: API slow (>{hedge_secs}s), starting local hedge')
+            dlog(f'[FALLBACK] {label}: ' + (f'API slow (>{hedge_secs}s), starting local hedge'
+                                             if hedge_secs else 'racing local alongside the API'))
             hedge_started = True
             local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             local_future = local_executor.submit(_transcribe_local, make_local_buf())
@@ -1740,7 +1759,20 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
         if local_future is not None:
             try:
                 local_text = local_future.result(timeout=0)
-                # Local finished first.
+                # Local finished first. The API knows the vocab hint and is
+                # usually more accurate, so give it a short grace period.
+                grace = getattr(config, 'API_GRACE_SECS', 1.0)
+                if not api_done and grace > 0 and not breaker_open:
+                    try:
+                        late = api_future.result(timeout=grace)
+                        if late is not None:
+                            dlog(f'[FALLBACK] {label}: API answered within the grace period, using it')
+                            _api_healthy()
+                            if local_executor:
+                                local_executor.shutdown(wait=False)
+                            return late
+                    except Exception:
+                        pass
                 dlog(f'[FALLBACK] {label}: local result won the race')
                 if not breaker_open:
                     # A hedge win means the API was too slow to use, which
@@ -1765,11 +1797,7 @@ def _resolve_with_hedge(api_future, wav_bytes, label):
     # API finished (success or error).
     if api_done and api_text is not None:
         dlog(f'[FALLBACK] {label}: API result arrived first')
-        with lock:
-            if _api_consecutive_failures > 0:
-                _api_consecutive_failures = 0
-                dlog(f'[FALLBACK] circuit breaker reset, API healthy')
-            _api_breaker_open_until = 0.0
+        _api_healthy()
         if local_executor:
             local_executor.shutdown(wait=False)
         return api_text
@@ -2351,14 +2379,14 @@ _llm_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 def _llm_complete(system, user, max_tokens, temperature, purpose):
     """Run one chat completion down the chain. Returns (text, model)."""
-    if _api_breaker_is_open():
-        # The API is stalling, which on this machine has meant the network
-        # is: every provider is slow, so don't make the paste wait on any
-        raise RuntimeError("skipped, transcription API in local-first mode")
+    if _network_is_slow():
+        # The transcription API just stalled, which on this machine has meant
+        # the network is slow for every provider: don't make the paste wait
+        raise RuntimeError("skipped, network slow (transcription API just missed its window)")
     errors = []
     # The whole chain shares one time budget: the paste is waiting, and
     # unchecked text now beats checked text in 20 seconds
-    deadline = time.time() + getattr(config, "LLM_BUDGET_SECS", 3)
+    deadline = time.time() + getattr(config, "LLM_BUDGET_SECS", 2)
     for get_client, model, extra, headroom in _llm_chain():
         remaining = deadline - time.time()
         if remaining < 0.5:
