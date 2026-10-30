@@ -175,7 +175,6 @@ audio_frames = []          # All frames from this recording session
 stream = None
 lock = threading.Lock()
 client = None              # OpenAI client, initialized at startup
-anthropic_client = None    # Anthropic client, fallback for GPT calls
 tray_icon = None           # System tray icon (pystray)
 # When running as a PyInstaller .exe, look for icons next to the exe
 if getattr(sys, 'frozen', False):
@@ -539,6 +538,7 @@ def _save_api_key(key):
         config.CLEANUP_MODEL = "openai/gpt-oss-20b"
         config.CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
         config.CLEANUP_TOKEN_HEADROOM = 512
+        config.CLEANUP_FALLBACK_MODELS = ["openai/gpt-oss-120b"]
     else:
         config.OPENAI_API_KEY = key
         if config.API_PROVIDER != "groq":
@@ -1802,23 +1802,14 @@ def stitch_chunks(chunk_texts):
         dlog("[STITCH] Every seam overlaps, stitching locally")
         return _stitch_local(chunk_texts)
 
-    # Otherwise try GPT-based stitching
+    # Otherwise ask an LLM, which can untangle seams the matcher can't
     try:
         numbered = "\n".join(f"[Chunk {i+1}]: {t}" for i, t in enumerate(chunk_texts))
         # Sized to input for the same rate-limit reasons as cleanup_text
-        response = client.with_options(max_retries=0).chat.completions.create(
-            model=config.CLEANUP_MODEL,
-            messages=[
-                {"role": "system", "content": STITCH_PROMPT},
-                {"role": "user", "content": numbered},
-            ],
-            temperature=0.2,
-            max_tokens=min(4000, max(300, len(numbered) // 2)) + _cleanup_headroom(),
-            extra_body=_cleanup_extra_body(),
-        )
-        result = (response.choices[0].message.content or "").strip()
-        if not result:
-            raise ValueError("empty stitch response")
+        result, model = _llm_complete(
+            STITCH_PROMPT, numbered,
+            max_tokens=min(4000, max(300, len(numbered) // 2)),
+            temperature=0.2, purpose="stitch")
 
         # Guard: stitched output can't exceed the combined chunks. If it grew,
         # the model answered the dictation content instead of stitching it.
@@ -1826,41 +1817,10 @@ def stitch_chunks(chunk_texts):
         if len(result) > combined_len * 1.2 + 40:
             dlog(f"[STITCH] Output grew {combined_len}->{len(result)} chars — model answered instead of stitching. Using local stitch.")
             return _stitch_local(chunk_texts)
-
-        # Track usage
-        u = response.usage
-        if u:
-            cost = usage.log_gpt_call("stitch", config.CLEANUP_MODEL,
-                                       input_tokens=u.prompt_tokens,
-                                       output_tokens=u.completion_tokens)
-            log(f"Stitched result: {result[:100]}... (tokens: {u.prompt_tokens}+{u.completion_tokens}, cost: ${cost:.4f})")
-        else:
-            log(f"Stitched result: {result[:100]}...")
+        log(f"Stitched result ({model}): {result[:100]}...")
         return result
     except Exception as e:
-        dlog(f"[STITCH] GPT stitching failed ({e}), trying Claude fallback...")
-        return _stitch_claude(chunk_texts)
-
-
-def _stitch_claude(chunk_texts):
-    """Use Claude as fallback for chunk stitching when OpenAI is unavailable."""
-    if not anthropic_client:
-        dlog(f"[STITCH] No Anthropic client available, falling back to local stitch")
-        return _stitch_local(chunk_texts)
-    try:
-        numbered = "\n".join(f"[Chunk {i+1}]: {t}" for i, t in enumerate(chunk_texts))
-        dlog(f"[STITCH] Calling Claude ({config.CLAUDE_MODEL}) for stitching...")
-        response = anthropic_client.messages.create(
-            model=config.CLAUDE_MODEL,
-            max_tokens=8192,
-            system=STITCH_PROMPT,
-            messages=[{"role": "user", "content": numbered}],
-        )
-        result = response.content[0].text.strip()
-        dlog(f"[STITCH] Claude stitched OK: '{result[:80]}...'")
-        return result
-    except Exception as e:
-        dlog(f"[STITCH] Claude stitching also failed ({e}), falling back to local stitch")
+        dlog(f"[STITCH] LLM stitching unavailable ({e}), falling back to local stitch")
         return _stitch_local(chunk_texts)
 
 
@@ -2268,76 +2228,152 @@ def transcribe_file(path):
 
 # ─── Cleanup with GPT ────────────────────────────────────────────────────────
 def cleanup_text(raw_text):
-    """Send raw transcription through GPT (or Claude fallback) for light cleanup."""
+    """Send raw transcription through an LLM for light cleanup."""
     # Always strip fillers first (free, local)
     raw_text = strip_fillers(raw_text)
 
     if not config.ENABLE_CLEANUP:
         return raw_text
 
-    # Try GPT first
     try:
-        log("Cleaning up with GPT...")
+        log("Cleaning up with LLM...")
         # Groq's free tier reserves max_tokens against a 6k/min budget, so size it
         # to the input (cleanup output is never longer) instead of a fixed 4096.
-        # max_retries=0: a rate-limited cleanup should fall back instantly, not
-        # silently sleep 10-20s in SDK backoff while the paste waits.
-        response = client.with_options(max_retries=0).chat.completions.create(
-            model=config.CLEANUP_MODEL,
-            messages=[
-                {"role": "system", "content": config.CLEANUP_SYSTEM_PROMPT},
-                {"role": "user", "content": f"<transcript>\n{raw_text}\n</transcript>"},
-            ],
-            temperature=0.3,
-            max_tokens=min(2500, max(150, len(raw_text) // 2)) + _cleanup_headroom(),
-            extra_body=_cleanup_extra_body(),
-        )
-        cleaned = (response.choices[0].message.content or "").strip()
-        if not cleaned:
-            raise ValueError("empty cleanup response")
-        # Small models echo the tags and append notes like "(No changes needed)"
-        m = re.search(r"<transcript>(.*?)</transcript>", cleaned, re.S)
-        if m:
-            cleaned = m.group(1)
-        cleaned = re.sub(r"</?transcript>", "", cleaned)
-        cleaned = re.sub(r"\n\s*\([^)\n]*\)\s*$", "", cleaned).strip()
+        cleaned, model = _llm_complete(
+            _cleanup_system_prompt(), f"<transcript>\n{raw_text}\n</transcript>",
+            max_tokens=min(2500, max(150, len(raw_text) // 2)),
+            temperature=0.3, purpose="cleanup")
+    except Exception as e:
+        # Every model failed: the local steps (fillers, corrections, echo and
+        # loop guards) still ran, so paste that rather than nothing
+        dlog(f"[CLEANUP] LLM cleanup unavailable ({e}), returning raw text")
+        return raw_text
 
-        # Guard: cleanup can only shrink text or barely change it. If the model
-        # returned something much longer, it answered the dictation instead of
-        # cleaning it (small models do this when the transcript is a question).
-        if len(cleaned) > len(raw_text) * 1.3 + 40:
-            dlog(f"[CLEANUP] Output grew {len(raw_text)}->{len(cleaned)} chars — model answered instead of cleaning. Using raw text.")
-            return raw_text
+    # Small models echo the tags and append notes like "(No changes needed)"
+    m = re.search(r"<transcript>(.*?)</transcript>", cleaned, re.S)
+    if m:
+        cleaned = m.group(1)
+    cleaned = re.sub(r"</?transcript>", "", cleaned)
+    cleaned = re.sub(r"\n\s*\([^)\n]*\)\s*$", "", cleaned).strip()
 
-        # Track usage
+    # Guard: cleanup can only shrink text or barely change it. If the model
+    # returned something much longer, it answered the dictation instead of
+    # cleaning it (small models do this when the transcript is a question).
+    if not cleaned or len(cleaned) > len(raw_text) * 1.3 + 40:
+        dlog(f"[CLEANUP] Output grew {len(raw_text)}->{len(cleaned)} chars — model answered instead of cleaning. Using raw text.")
+        return raw_text
+    log(f"Cleaned text ({model}): {cleaned}")
+    return cleaned
+
+
+def _cleanup_terms():
+    """Names the speaker uses, from the Whisper hint, custom vocab and corrections."""
+    terms = []
+    for part in re.split(r"[,.;]", config.WHISPER_PROMPT or ""):
+        part = part.strip()
+        if part and part.lower() != "voza dictation":
+            terms.append(part)
+    terms += load_custom_vocab()
+    terms += list(load_corrections().values())
+    seen, out = set(), []
+    for t in terms:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def _cleanup_system_prompt():
+    terms = _cleanup_terms()
+    if not terms:
+        return config.CLEANUP_SYSTEM_PROMPT
+    return (config.CLEANUP_SYSTEM_PROMPT
+            + "\n\nNames and terms this speaker uses: " + ", ".join(terms) + "."
+            + "\nWhen a word or phrase in the transcript sounds like one of these and"
+            + " the sentence clearly means it (a garbled place, product or person name),"
+            + " use this spelling. Never swap one in for a word that already makes sense.")
+
+
+# ─── LLM chain ───────────────────────────────────────────────────────────────
+# Cleanup and stitching try each model in turn, so a retired model or a dead
+# provider degrades to the next one instead of silently switching the step off
+# (Groq retired llama-3.1-8b-instant and cleanup was skipped for weeks).
+_fallback_clients = {}
+_llm_warned_at = 0.0
+
+
+def _fallback_client(name):
+    if name not in _fallback_clients:
+        if name == "openai":
+            _fallback_clients[name] = OpenAI(api_key=config.OPENAI_API_KEY)
+        else:  # Claude through Anthropic's OpenAI-compatible endpoint
+            _fallback_clients[name] = OpenAI(api_key=config.ANTHROPIC_API_KEY,
+                                             base_url="https://api.anthropic.com/v1/")
+    return _fallback_clients[name]
+
+
+def _llm_chain():
+    """(client getter, model, extra_body, token headroom), best first."""
+    chain = []
+    if client is not None and config.API_KEY:
+        for model in [config.CLEANUP_MODEL] + list(getattr(config, "CLEANUP_FALLBACK_MODELS", [])):
+            chain.append((lambda: client, model, _cleanup_extra_body(), _cleanup_headroom()))
+    if config.OPENAI_API_KEY and config.API_PROVIDER != "openai":
+        chain.append((lambda: _fallback_client("openai"), "gpt-4o-mini", None, 0))
+    if config.ANTHROPIC_API_KEY:
+        chain.append((lambda: _fallback_client("anthropic"), config.CLAUDE_MODEL, None, 0))
+    return chain
+
+
+def _llm_complete(system, user, max_tokens, temperature, purpose):
+    """Run one chat completion down the chain. Returns (text, model)."""
+    errors = []
+    for get_client, model, extra, headroom in _llm_chain():
+        try:
+            # max_retries=0: a rate-limited call should move down the chain
+            # at once, not sleep 10-20s in SDK backoff while the paste waits
+            response = get_client().with_options(max_retries=0, timeout=20).chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                temperature=temperature,
+                max_tokens=max_tokens + headroom,
+                extra_body=extra,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if not text:
+                raise ValueError("empty response")
+        except Exception as e:
+            errors.append(f"{model}: {type(e).__name__}: {str(e)[:200]}")
+            dlog(f"[LLM] {purpose}: {errors[-1]}")
+            continue
         u = response.usage
         if u:
-            cost = usage.log_gpt_call("cleanup", config.CLEANUP_MODEL,
-                                       input_tokens=u.prompt_tokens,
-                                       output_tokens=u.completion_tokens)
-            log(f"Cleaned text: {cleaned} (tokens: {u.prompt_tokens}+{u.completion_tokens}, cost: ${cost:.4f})")
-        else:
-            log(f"Cleaned text: {cleaned}")
-        return cleaned
-    except Exception as e:
-        dlog(f"[CLEANUP] GPT cleanup failed ({e}), trying Claude...")
+            usage.log_gpt_call(purpose, model, input_tokens=u.prompt_tokens,
+                               output_tokens=u.completion_tokens)
+        if errors:
+            dlog(f"[LLM] {purpose}: answered by fallback {model}")
+            if any("model_not_found" in x or "does not exist" in x for x in errors):
+                _llm_warn(f"A text-cleanup model was retired, so Voza is using {model} instead. "
+                          f"Update CLEANUP_MODEL in config.py.")
+        return text, model
+    _llm_warn("Text cleanup is offline: every model failed, so dictations are pasted "
+              "unchecked. Details in voza_debug.log.")
+    raise RuntimeError("; ".join(errors) or "no LLM configured")
 
-    # Fall back to Claude
-    if anthropic_client:
-        try:
-            response = anthropic_client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=4096,
-                system=config.CLEANUP_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": raw_text}],
-            )
-            cleaned = response.content[0].text.strip()
-            dlog(f"[CLEANUP] Claude cleanup OK: '{cleaned[:80]}...'")
-            return cleaned
-        except Exception as e2:
-            dlog(f"[CLEANUP] Claude cleanup also failed ({e2}), returning raw text")
 
-    return raw_text
+def _llm_warn(message):
+    """Log loudly, and show a tray notification at most once an hour."""
+    global _llm_warned_at
+    dlog(f"[LLM] WARNING: {message}")
+    if time.time() - _llm_warned_at < 3600:
+        return
+    _llm_warned_at = time.time()
+    try:
+        if tray_icon:
+            tray_icon.notify(message, config.APP_NAME)
+    except Exception:
+        pass
 
 
 # ─── Text Insertion ──────────────────────────────────────────────────────────
@@ -2832,15 +2868,14 @@ def main():
         config.ENABLE_CLEANUP = False
         config.API_FALLBACK_TO_LOCAL = False
 
-    # Set up Anthropic client as fallback for GPT calls (stitching, cleanup)
+    # Backup models for cleanup and stitching, tried in order if one fails
+    backups = list(getattr(config, "CLEANUP_FALLBACK_MODELS", []))
+    if config.OPENAI_API_KEY and config.API_PROVIDER != "openai":
+        backups.append("gpt-4o-mini")
     if config.ANTHROPIC_API_KEY:
-        try:
-            import anthropic
-            anthropic_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-            print(f"  ✓ Anthropic API key loaded (Claude fallback for stitching/cleanup)")
-        except ImportError:
-            print(f"  ⚠ anthropic package not installed — run: pip install anthropic")
-            anthropic_client = None
+        backups.append(config.CLAUDE_MODEL)
+    if backups and config.ENABLE_CLEANUP:
+        print(f"  ✓ Cleanup backups: {', '.join(backups)}")
 
     if not check_microphone():
         sys.exit(1)

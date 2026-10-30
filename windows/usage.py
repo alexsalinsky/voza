@@ -20,6 +20,10 @@ PRICING = {
         "input": 0.005,          # per 1K tokens
         "output": 0.015,         # per 1K tokens
     },
+    "openai/gpt-oss-120b": {
+        "input": 0.00015,        # per 1K tokens (Groq)
+        "output": 0.00060,       # per 1K tokens (Groq)
+    },
     "openai/gpt-oss-20b": {
         "input": 0.000075,       # per 1K tokens (Groq)
         "output": 0.00030,       # per 1K tokens (Groq)
