@@ -1448,8 +1448,18 @@ def _parakeet_available():
         return False
 
 
+_local_model_lock = threading.Lock()
+
+
 def _ensure_local_model():
     """Load the configured local model (Parakeet or Whisper) if not already loaded."""
+    # Startup preloads in the background while a hedge may ask at the same
+    # time: load once
+    with _local_model_lock:
+        _ensure_local_model_unlocked()
+
+
+def _ensure_local_model_unlocked():
     global local_whisper_model, local_parakeet_model
 
     if config.LOCAL_ENGINE == "parakeet":
@@ -2326,9 +2336,7 @@ def _fallback_client(name):
 def _llm_chain():
     """(client getter, model, extra_body, token headroom), best first."""
     chain = []
-    # While the transcription API is failing or stalling, its provider's chat
-    # models usually are too: skip them rather than wait on them
-    if client is not None and config.API_KEY and not _api_breaker_is_open():
+    if client is not None and config.API_KEY:
         for model in [config.CLEANUP_MODEL] + list(getattr(config, "CLEANUP_FALLBACK_MODELS", [])):
             chain.append((lambda: client, model, _cleanup_extra_body(), _cleanup_headroom()))
     if config.OPENAI_API_KEY and config.API_PROVIDER != "openai":
@@ -2338,12 +2346,19 @@ def _llm_chain():
     return chain
 
 
+_llm_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
 def _llm_complete(system, user, max_tokens, temperature, purpose):
     """Run one chat completion down the chain. Returns (text, model)."""
+    if _api_breaker_is_open():
+        # The API is stalling, which on this machine has meant the network
+        # is: every provider is slow, so don't make the paste wait on any
+        raise RuntimeError("skipped, transcription API in local-first mode")
     errors = []
     # The whole chain shares one time budget: the paste is waiting, and
     # unchecked text now beats checked text in 20 seconds
-    deadline = time.time() + getattr(config, "LLM_BUDGET_SECS", 6)
+    deadline = time.time() + getattr(config, "LLM_BUDGET_SECS", 3)
     for get_client, model, extra, headroom in _llm_chain():
         remaining = deadline - time.time()
         if remaining < 0.5:
@@ -2352,7 +2367,11 @@ def _llm_complete(system, user, max_tokens, temperature, purpose):
         try:
             # max_retries=0: a rate-limited call should move down the chain
             # at once, not sleep 10-20s in SDK backoff while the paste waits
-            response = get_client().with_options(max_retries=0, timeout=remaining).chat.completions.create(
+            # The SDK timeout applies per network phase, not to the whole
+            # call (a 6s budget took 13s on a slow connection), so enforce the
+            # deadline here and abandon the call if it runs over
+            future = _llm_pool.submit(
+                get_client().with_options(max_retries=0, timeout=remaining).chat.completions.create,
                 model=model,
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}],
@@ -2360,6 +2379,10 @@ def _llm_complete(system, user, max_tokens, temperature, purpose):
                 max_tokens=max_tokens + headroom,
                 extra_body=extra,
             )
+            try:
+                response = future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"no answer within {remaining:.1f}s")
             text = (response.choices[0].message.content or "").strip()
             if not text:
                 raise ValueError("empty response")
@@ -2907,6 +2930,10 @@ def main():
     if config.TRANSCRIPTION_MODE == "local":
         print("  ⏳ Loading local Whisper model (first launch may take a moment)...")
         _ensure_local_model()
+    elif config.API_FALLBACK_TO_LOCAL:
+        # Warm the local model in the background so the first slow-API hedge
+        # doesn't also pay the 3s model load
+        threading.Thread(target=_ensure_local_model, daemon=True).start()
 
     # Status display
     if config.TRANSCRIPTION_MODE == "api":

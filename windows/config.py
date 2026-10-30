@@ -110,7 +110,7 @@ API_BREAKER_COOLDOWN_SECS = 180
 
 # Total seconds cleanup or stitching may spend across all LLM fallbacks
 # before Voza pastes the text without them
-LLM_BUDGET_SECS = 6
+LLM_BUDGET_SECS = 3  # Groq cleanup normally takes under 1s
 
 # Whisper prompt hint — helps the model recognize uncommon words
 # Add names, jargon, or brand names that Whisper might mishear
