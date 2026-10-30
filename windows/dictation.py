@@ -1557,6 +1557,7 @@ def _transcribe_api(wav_buf):
         else:
             text = _strip_echo_text((response.text or "").strip(), "API")
     text = _strip_repeat_loops(text, "API")
+    text = _strip_vocab_list_echo(text, "API")
 
     # Track usage
     cost = usage.log_whisper_api_call(audio_seconds, config.WHISPER_MODEL)
@@ -1634,6 +1635,7 @@ def _transcribe_local(wav_buf):
     seg_list = _filter_echo_segments(seg_list, "LOCAL", audio_secs=audio_seconds)
     text = " ".join(d["text"].strip() for d in seg_list).strip()
     text = _strip_repeat_loops(text, "LOCAL")
+    text = _strip_vocab_list_echo(text, "LOCAL")
 
     dlog(f"[LOCAL] Engine: whisper-{config.LOCAL_WHISPER_MODEL} | {audio_seconds:.1f}s audio")
     # Track usage (free, but still track volume)
@@ -1901,7 +1903,10 @@ def _find_chunk_overlap(result_words, next_words):
                 tail = a[len(a) - drop - length:len(a) - drop]
                 head = b[skip:skip + length]
                 misses = sum(1 for x, y in zip(tail, head) if not _stitch_words_match(x, y))
-                if misses == 0 or (length >= 6 and misses == 1):
+                # Whisper rehears a word or two differently ("if she's into
+                # that" / "if you zoom for that"): allow one miss in four
+                # once the run is long enough to be unmistakable
+                if misses == 0 or (length >= 6 and misses <= length // 4):
                     # Each word left outside the match costs two matched
                     # words, so a repeated phrase ("on and off, and on and
                     # off") pairs at the seam instead of reaching back.
@@ -1930,14 +1935,16 @@ def _stitch_local(chunk_texts):
         found = _find_chunk_overlap(result_words, next_words)
         if found:
             length, drop, skip = found
-            # The next chunk heard the seam in full, so its version wins:
-            # drop the result's clipped tail words and the repeated head.
-            kept = result_words[:len(result_words) - drop]
-            if length:
-                # Seam punctuation comes from the chunk that heard what followed
-                kept[-1] = next_words[skip + length - 1]
+            # Keep one copy of the overlap, built from both hearings without
+            # splicing mid-phrase: each chunk is least reliable at its cut
+            # edge, so the first two thirds come from the result and the rest
+            # (including the seam punctuation) from the next chunk.
+            start = len(result_words) - drop - length
+            split = (2 * length + 2) // 3
+            kept = result_words[:start + split]
+            tail = next_words[skip + split:]
             dlog(f"[STITCH] Found {length}-word overlap between chunk {i} and {i+1} (skip {skip}, drop {drop})")
-            result = " ".join(kept + next_words[skip + length:])
+            result = " ".join(kept + tail)
         else:
             dlog(f"[STITCH] No overlap found, concatenating chunk {i+1}")
             result = result + " " + next_chunk
@@ -2165,6 +2172,33 @@ def _prompt_terms():
         if n:
             terms.add(n)
     return terms
+
+
+def _strip_vocab_list_echo(text, source):
+    """Remove the custom vocab list recited as a phrase, wherever it appears.
+
+    Whisper hallucinates the hint list itself ("En Blazes LLC, transferencia,
+    Ivaylo.") on pauses, and Groq reports no_speech=0.0 for it, so the
+    acoustic echo guard keeps it. Nobody says the whole list in order, so the
+    full sequence goes regardless of acoustics. Single words stay."""
+    words = load_custom_vocab()
+    if not text or len(words) < 2:
+        return text
+    seq = _normalize_match(", ".join(words)).split()
+    toks = text.split()
+    norm = [_normalize_match(t) for t in toks]
+    out, i, changed = [], 0, False
+    while i < len(toks):
+        window = " ".join(n for n in norm[i:i + len(seq)] if n)
+        if norm[i] and _fuzzy_ratio(window, " ".join(seq)) >= 0.85:
+            dlog(f"[ECHO-GUARD] {source}: dropped recited vocab list "
+                 f"'{' '.join(toks[i:i + len(seq)])}'")
+            i += len(seq)
+            changed = True
+        else:
+            out.append(toks[i])
+            i += 1
+    return " ".join(out).strip(" ,;") if changed else text
 
 
 def _strip_repeat_loops(text, source):
