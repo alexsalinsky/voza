@@ -1791,7 +1791,16 @@ def stitch_chunks(chunk_texts):
 
     log(f"Stitching {len(chunk_texts)} chunks...")
 
-    # Try GPT-based stitching first
+    # When every seam has a clear overlap, merge locally. The model sometimes
+    # keeps both copies of a seam Whisper heard slightly differently
+    # ("organized because I feel..." / "Organize, but I feel..."), and the
+    # local matcher is built for exactly that.
+    if all(_find_chunk_overlap(chunk_texts[i - 1].split(), chunk_texts[i].split())
+           for i in range(1, len(chunk_texts))):
+        dlog("[STITCH] Every seam overlaps, stitching locally")
+        return _stitch_local(chunk_texts)
+
+    # Otherwise try GPT-based stitching
     try:
         numbered = "\n".join(f"[Chunk {i+1}]: {t}" for i, t in enumerate(chunk_texts))
         # Sized to input for the same rate-limit reasons as cleanup_text
@@ -1881,7 +1890,7 @@ def _find_chunk_overlap(result_words, next_words):
     """
     a = [_stitch_word(w) for w in result_words]
     b = [_stitch_word(w) for w in next_words]
-    best = None  # (length, -(skip+drop), drop, skip)
+    best = None  # (score, length, drop, skip)
     for skip in range(0, min(4, len(b))):
         for drop in range(0, min(5, len(a))):
             max_len = min(30, len(a) - drop, len(b) - skip)
@@ -1893,7 +1902,10 @@ def _find_chunk_overlap(result_words, next_words):
                 head = b[skip:skip + length]
                 misses = sum(1 for x, y in zip(tail, head) if not _stitch_words_match(x, y))
                 if misses == 0 or (length >= 6 and misses == 1):
-                    cand = (length, -(skip + drop), drop, skip)
+                    # Each word left outside the match costs two matched
+                    # words, so a repeated phrase ("on and off, and on and
+                    # off") pairs at the seam instead of reaching back.
+                    cand = (length - 2 * (skip + drop), length, drop, skip)
                     if best is None or cand > best:
                         best = cand
                     break
@@ -1902,7 +1914,7 @@ def _find_chunk_overlap(result_words, next_words):
         if a and b and len(a[-1]) >= 3 and b[0].startswith(a[-1]) and b[0] != a[-1]:
             return 0, 1, 0
         return None
-    return best[0], best[2], best[3]
+    return best[1], best[2], best[3]
 
 
 def _stitch_local(chunk_texts):
