@@ -76,6 +76,9 @@ if GROQ_API_KEY:
     CLEANUP_MODEL = "openai/gpt-oss-20b"
     CLEANUP_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
     CLEANUP_TOKEN_HEADROOM = 512
+    # Tried in order if CLEANUP_MODEL fails (then OpenAI, then Claude, when
+    # those keys are in .env)
+    CLEANUP_FALLBACK_MODELS = ["openai/gpt-oss-120b"]
 else:
     API_PROVIDER = "openai"
     API_KEY = OPENAI_API_KEY
@@ -84,6 +87,7 @@ else:
     CLEANUP_MODEL = "gpt-4o-mini"
     CLEANUP_EXTRA_BODY = {}
     CLEANUP_TOKEN_HEADROOM = 0
+    CLEANUP_FALLBACK_MODELS = []
 
 # ─── Transcription ───────────────────────────────────────────────────────────
 # "api"   → Cloud Whisper API (Groq or OpenAI, see above) — requires API key
